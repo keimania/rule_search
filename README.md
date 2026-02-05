@@ -3,6 +3,12 @@
 이 프로젝트는 한국거래소(KRX)의 규정 및 시행세칙을 효율적으로 관리하고 검색하기 위한 **Python Streamlit 기반의 대시보드**입니다. 
 HWP 형식의 규정 파일을 텍스트와 CSV로 변환하여 DB를 구축하고, 웹 인터페이스를 통해 조항별 히스토리 추적, 통합 검색, 상호 인용 분석 기능을 제공합니다.
 
+## 🌐 웹에서 바로 실행하기 (Live Demo)
+복잡한 설치 과정 없이 아래 링크를 클릭하면 웹 브라우저에서 바로 규정 검색 시스템을 사용할 수 있습니다.
+👉 **[규정 검색 시스템 바로가기](https://rulesearch-9hkfiouvzz6s9eecftwc7d.streamlit.app/)**
+
+---
+
 ## 📌 주요 기능 (Features)
 
 * **규정 DB 구축**: 규정 파일(HWP/TXT/CSV)을 파싱하여 SQLite DB에 저장
@@ -12,7 +18,9 @@ HWP 형식의 규정 파일을 텍스트와 CSV로 변환하여 DB를 구축하�
 * **조항 상세 분석**: 특정 시점의 조항 상세 내용 조회
 * **인용(역참조) 분석**: 특정 조항이 내부, 파트너 규정(세칙), 타 규정에서 어떻게 인용되고 있는지 분석
 
-## 🛠 설치 방법 (Installation)
+## 🛠 설치 방법 (Installation) - 로컬 실행용
+
+*웹에서 바로 사용하실 분은 위 **[Live Demo]** 링크를 이용하세요. 직접 코드를 수정하거나 로컬에서 실행하고 싶다면 아래 절차를 따르세요.*
 
 ### 1. 저장소 클론 (Clone)
 ```bash
@@ -33,7 +41,6 @@ venv\Scripts\activate
 
 # 가상환경 활성화 (Mac/Linux)
 source venv/bin/activate
-
 ```
 
 ### 3. 필수 패키지 설치 (Install Dependencies)
@@ -44,6 +51,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+---
 
 ## 🚀 사용 방법 (Usage)
 
@@ -68,7 +76,6 @@ python hwp_to_txt.py
 ```bash
 python 규정_txt_to_csv.py
 ```
-
 
 
 ### 2. 대시보드 실행
