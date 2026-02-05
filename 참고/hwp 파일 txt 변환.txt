@@ -1,0 +1,2 @@
+pip install --user --pre pyhwp
+C:\Users\100186\AppData\Roaming\Python\Python314\Scripts\hwp5txt --output "코스닥시장 업무규정_전문.txt" "코스닥시장 업무규정_전문.hwp"
