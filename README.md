@@ -5,6 +5,7 @@ HWP 형식의 규정 파일을 텍스트와 CSV로 변환하여 DB를 구축하�
 
 ## 🌐 웹에서 바로 실행하기 (Live Demo)
 복잡한 설치 과정 없이 아래 링크를 클릭하면 웹 브라우저에서 바로 규정 검색 시스템을 사용할 수 있습니다.
+
 👉 **[규정 검색 시스템 바로가기](https://rulesearch-9hkfiouvzz6s9eecftwc7d.streamlit.app/)**
 
 ---
@@ -20,11 +21,11 @@ HWP 형식의 규정 파일을 텍스트와 CSV로 변환하여 DB를 구축하�
 
 ## 🛠 설치 방법 (Installation) - 로컬 실행용
 
-*웹에서 바로 사용하실 분은 위 **[Live Demo]** 링크를 이용하세요. 직접 코드를 수정하거나 로컬에서 실행하고 싶다면 아래 절차를 따르세요.*
+*웹에서 바로 사용하실 분은 위 **[규정 검색 시스템 바로가기](https://rulesearch-9hkfiouvzz6s9eecftwc7d.streamlit.app/)** 링크를 이용하세요. 직접 코드를 수정하거나 로컬에서 실행하고 싶다면 아래 절차를 따르세요.*
 
 ### 1. 저장소 클론 (Clone)
 ```bash
-git clone [https://github.com/keimania/rule_search.git](https://github.com/keimania/rule_search.git)
+git clone https://github.com/keimania/rule_search.git
 cd rule_search
 ```
 
