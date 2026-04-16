@@ -22,7 +22,7 @@ def convert_all_hwp_to_txt():
     print(f"'{target_folder}' 폴더에서 {len(hwp_files)}개의 파일을 발견했습니다. 변환을 시작합니다...\n")
 
     # 2. hwp5txt 실행 파일 경로 설정
-    exe_path = r"C:\Users\100186\AppData\Roaming\Python\Python314\Scripts\hwp5txt.exe"
+    exe_path = r"hwp5txt"
 
     for hwp_path in hwp_files:
         # 3. 출력할 파일 경로 생성
