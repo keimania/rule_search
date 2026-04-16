@@ -4,6 +4,7 @@
 한국거래소 세칙 파싱 스크립트 (Subfolder Version)
 현재 폴더 하위의 '규정' 폴더 내 모든 .txt 파일을 읽어
 해당 폴더 내에 동일한 이름의 .csv 파일로 변환합니다.
+(이미 변환된 파일이 있을 경우 건너뜁니다.)
 """
 
 import re
@@ -332,10 +333,10 @@ def build_stats(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------
-# 8. 메인 실행부 (폴더 경로 수정)
+# 8. 메인 실행부 (폴더 경로 수정 및 스킵 로직 추가)
 # ----------------------------------------------------------------------
 def main():
-    # 수정된 부분: "규정" 폴더를 타겟으로 설정
+    # "규정" 폴더를 타겟으로 설정
     target_dir = Path("규정")
 
     # 규정 폴더 존재 여부 확인
@@ -354,6 +355,14 @@ def main():
     print(f"'{target_dir}' 폴더에서 총 {len(txt_files)}개의 txt 파일을 발견했습니다. 변환을 시작합니다...\n")
 
     for txt_path in txt_files:
+        # 생성될 csv 파일 경로 지정
+        output_csv_path = txt_path.with_suffix(".csv")
+
+        # 4. 동일한 이름의 csv 파일이 이미 존재하는지 확인 (추가된 부분)
+        if output_csv_path.exists():
+            print(f">> 건너뜀: {output_csv_path.name} 파일이 이미 존재합니다.")
+            continue # 파일이 있으면 처리하지 않고 다음으로 넘어감
+
         try:
             print(f">> 처리 중: {txt_path.name}")
             
@@ -367,7 +376,6 @@ def main():
             stats_df = build_stats(df)
 
             # 4. 저장 (규정 폴더 내부에 csv 저장)
-            output_csv_path = txt_path.with_suffix(".csv")
             # stats_csv_path = txt_path.with_name(f"{txt_path.stem}_stats.csv")
 
             df.to_csv(output_csv_path, index=False, encoding="utf-8-sig")

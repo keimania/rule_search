@@ -29,16 +29,20 @@ def convert_all_hwp_to_txt():
         # os.path.splitext를 사용하면 '규정/파일이름'까지 추출됩니다.
         file_path_without_ext = os.path.splitext(hwp_path)[0]
         txt_path = f"{file_path_without_ext}.txt"
+        file_name = os.path.basename(hwp_path)
 
-        # 4. 명령어 구성
+        # 4. 동일한 이름의 txt 파일이 이미 존재하는지 확인 (추가된 부분)
+        if os.path.exists(txt_path):
+            print(f"건너뜀: {os.path.basename(txt_path)} 파일이 이미 존재합니다.")
+            continue # 다음 파일로 넘어감
+
+        # 5. 명령어 구성
         command = [exe_path, "--output", txt_path, hwp_path]
 
         try:
-            # 파일명만 출력하기 위해 os.path.basename 사용
-            file_name = os.path.basename(hwp_path)
             print(f"변환 중: {file_name} -> {os.path.basename(txt_path)}")
             
-            # 5. 명령어 실행
+            # 6. 명령어 실행
             subprocess.run(command, check=True)
             print("  └─ 성공")
             
