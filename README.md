@@ -61,31 +61,36 @@ pip install -r requirements.txt
 규정 원문 파일(.hwp)이 있다면 아래 순서대로 데이터를 가공해야 합니다. 이미 `.csv` 파일이 `규정/` 폴더에 준비되어 있다면 이 단계는 건너뛰어도 됩니다.
 
 1. **파일 위치**: 프로젝트 폴더 내 `규정/` 폴더에 `.hwp` 파일을 위치시킵니다.
-2. **HWP → TXT 변환**:
-* *사전 준비*: `hwp5txt` 도구가 필요하며, `hwp_to_txt.py` 파일 내부의 `exe_path` 변수를 본인의 환경에 맞게 수정해야 합니다.
+2. **HWP → TXT 변환**: `pyhwp` 라이브러리를 사용하여 변환합니다.
+   - **방법 A (UI, 권장)**: 대시보드 실행 후 사이드바의 **"📄 HWP → TXT 변환"** 버튼을 클릭합니다.
+   - **방법 B (CLI)**: 터미널에서 스크립트를 직접 실행합니다.
+     ```bash
+     python hwp_to_txt.py
+     ```
 
-
-```bash
-python hwp_to_txt.py
-```
-
-
-3. **TXT → CSV 변환**:
-* 텍스트 파일을 파싱하여 DB 적재용 CSV 포맷으로 변환합니다.
-
-
-```bash
-python 규정_txt_to_csv.py
-```
+3. **TXT → CSV 변환**: 텍스트 파일을 파싱하여 DB 적재용 CSV 포맷으로 변환합니다.
+   - **방법 A (UI, 권장)**: 대시보드 사이드바의 **"📄 TXT → CSV 변환"** 버튼을 클릭합니다.
+   - **방법 B (CLI)**: 터미널에서 스크립트를 직접 실행합니다.
+     ```bash
+     python 규정_txt_to_csv.py
+     ```
 
 
 ### 2. 대시보드 실행
 
-Streamlit 앱을 실행합니다.
+환경에 맞는 방법으로 Streamlit 앱을 실행합니다.
 
+**Mac / Linux** — 터미널에서 실행 스크립트를 더블클릭하거나 아래 명령어를 입력합니다.
 ```bash
-streamlit run app.py
+./run.sh
 ```
+
+**Windows** — `run.bat` 파일을 더블클릭하거나 터미널에서 아래 명령어를 입력합니다.
+```bat
+run.bat
+```
+
+> 직접 입력하려면 `streamlit run app.py`를 사용해도 됩니다.
 
 ### 3. DB 업데이트
 
@@ -99,9 +104,11 @@ streamlit run app.py
 
 ```
 rule_search/
-├── app.py                  # Streamlit 메인 애플리케이션
-├── hwp_to_txt.py           # HWP 파일을 TXT로 변환하는 스크립트
-├── 규정_txt_to_csv.py       # TXT 파일을 파싱하여 CSV로 변환하는 스크립트
+├── app.py                  # Streamlit 메인 애플리케이션 (HWP→TXT, TXT→CSV 변환 포함)
+├── hwp_to_txt.py           # HWP 파일을 TXT로 변환하는 CLI 스크립트
+├── 규정_txt_to_csv.py       # TXT 파일을 파싱하여 CSV로 변환하는 CLI 스크립트
+├── run.sh                  # 앱 실행 스크립트 (Mac / Linux)
+├── run.bat                 # 앱 실행 스크립트 (Windows)
 ├── regulation_master.db    # 규정 데이터가 저장되는 SQLite DB (자동 생성됨)
 ├── requirements.txt        # 의존성 패키지 목록
 ├── README.md               # 프로젝트 설명서
@@ -111,5 +118,5 @@ rule_search/
 
 ## ⚠️ 주의 사항
 
-* **hwp_to_txt.py 경로 설정**: `hwp_to_txt.py` 파일을 실행하기 전에, 코드 내부의 `exe_path` 변수가 로컬 환경의 `hwp5txt.exe` 실제 경로와 일치하는지 반드시 확인해야 합니다.
+* **pyhwp 설치**: HWP 파일 변환을 위해 `pyhwp` 라이브러리가 필요합니다. `pip install -r requirements.txt` 나 `pip install pyhwp`로 설치하세요.
 * **파일명 규칙**: 파싱 로직의 정확성을 위해 규정 파일명은 `규정명_전문_YYYYMMDD` 형식을 권장합니다.

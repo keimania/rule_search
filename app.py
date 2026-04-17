@@ -5,8 +5,16 @@ import glob
 import os
 import re
 import io
+import sys
 from pathlib import Path
 import unicodedata
+
+# pyhwp 라이브러리 내부 모듈 임포트 시도
+try:
+    import hwp5.hwp5txt
+    HAS_PYHWP = True
+except ImportError:
+    HAS_PYHWP = False
 
 # =========================================================
 # 1. 설정 및 상수 정의
@@ -39,8 +47,61 @@ SECTION_PATTERN = re.compile(r"^제(\d+)절\s*(.+)")
 
 
 # =========================================================
-# 2. TXT -> CSV 파싱 관련 함수 통합 (규정_txt_to_csv.py 내용)
+# 2. HWP -> TXT 및 TXT -> CSV 변환 관련 함수
 # =========================================================
+def convert_hwp_to_txt_st():
+    """Streamlit 환경에서 실행하기 위한 HWP -> TXT 파싱 로직"""
+    target_dir = Path(DATA_DIR)
+    
+    if not target_dir.is_dir():
+        return -1, 0, 0, f"'{DATA_DIR}' 폴더가 없습니다."
+
+    hwp_files = list(target_dir.glob("*.hwp"))
+    if not hwp_files:
+        return 0, 0, 0, f"'{DATA_DIR}' 폴더 내에 .hwp 파일이 없습니다."
+
+    converted = 0
+    skipped = 0
+    errors = 0
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for idx, hwp_path in enumerate(hwp_files):
+        txt_path = hwp_path.with_suffix(".txt")
+        
+        if txt_path.exists():
+            skipped += 1
+        else:
+            status_text.text(f"처리 중: {hwp_path.name}")
+            
+            # 파이썬 내부 모듈(hwp5txt)을 직접 호출
+            original_argv = sys.argv
+            sys.argv = ['hwp5txt', '--output', str(txt_path), str(hwp_path)]
+            
+            try:
+                hwp5.hwp5txt.main()
+                # 에러 없이 정상 리턴되는 경우 카운트 증가
+                converted += 1
+            except SystemExit as e:
+                # hwp5txt.main()이 내부적으로 sys.exit()을 호출하는 경우 에러 코드로 분기
+                if e.code == 0 or e.code is None:
+                    converted += 1
+                else:
+                    st.error(f"'{hwp_path.name}' 변환 실패 (에러 코드: {e.code})")
+                    errors += 1
+            except Exception as e:
+                st.error(f"'{hwp_path.name}' 처리 중 알 수 없는 오류: {e}")
+                errors += 1
+            finally:
+                sys.argv = original_argv
+                
+        progress_bar.progress((idx + 1) / len(hwp_files))
+        
+    status_text.empty()
+    progress_bar.empty()
+    return converted, skipped, errors, "완료"
+
 def read_source_text(filename: str) -> str:
     path = Path(filename)
     if not path.exists():
@@ -317,7 +378,6 @@ def convert_txt_files_to_csv():
     skipped = 0
     errors = 0
     
-    # UI 프로그레스 바를 위한 Generator 방식 또는 Streamlit 컨테이너 업데이트
     progress_bar = st.progress(0)
     status_text = st.empty()
     
@@ -337,7 +397,6 @@ def convert_txt_files_to_csv():
                 st.error(f"'{txt_path.name}' 처리 중 오류: {e}")
                 errors += 1
         
-        # 진행 상태 업데이트
         progress_bar.progress((idx + 1) / len(txt_files))
         
     status_text.empty()
@@ -514,8 +573,23 @@ st.set_page_config(page_title="금융 규정 검색 시스템", layout="wide", p
 with st.sidebar:
     st.header("⚙️ 관리 및 메뉴")
     
-    # --- [추가됨] TXT -> CSV 변환 버튼 ---
+    # --- 원본 파일 처리 (HWP -> TXT -> CSV) ---
     st.markdown("**(1) 원본 파일 처리**")
+    
+    # [추가됨] HWP -> TXT 변환 버튼
+    if st.button("📄 HWP -> TXT 변환"):
+        if not HAS_PYHWP:
+            st.error("pyhwp 라이브러리가 설치되어 있지 않습니다. 터미널에서 'pip install pyhwp'를 실행해주세요.")
+        else:
+            with st.spinner("HWP 파일을 파싱하여 TXT로 변환 중입니다..."):
+                conv, skip, err, msg = convert_hwp_to_txt_st()
+                if conv == -1:
+                    st.warning(msg)
+                elif conv == 0 and skip == 0:
+                    st.info(msg)
+                else:
+                    st.success(f"HWP->TXT 변환 완료! (신규: {conv}개, 건너뜀: {skip}개, 오류: {err}개)")
+
     if st.button("📄 TXT -> CSV 변환"):
         with st.spinner("TXT 파일을 파싱하여 CSV로 변환 중입니다..."):
             conv, skip, err, msg = convert_txt_files_to_csv()
@@ -524,7 +598,7 @@ with st.sidebar:
             elif conv == 0 and skip == 0:
                 st.info(msg)
             else:
-                st.success(f"변환 완료! (신규: {conv}개, 건너뜀: {skip}개, 오류: {err}개)")
+                st.success(f"TXT->CSV 변환 완료! (신규: {conv}개, 건너뜀: {skip}개, 오류: {err}개)")
     
     st.markdown("**(2) 시스템 DB 등록**")
     if st.button("🔄 DB 업데이트 (증분)"):
@@ -532,7 +606,7 @@ with st.sidebar:
             cnt, skip = load_files()
         
         if cnt == -1:
-            st.warning(f"폴더가 생성되었습니다. CSV/TXT 파일을 '{DATA_DIR}'에 넣어주세요.")
+            st.warning(f"폴더가 생성되었습니다. CSV 파일을 '{DATA_DIR}'에 넣어주세요.")
         else:
             st.success(f"DB 업데이트 완료! (신규: {cnt}개, 건너뜀: {skip}개)")
     
