@@ -566,67 +566,255 @@ def export_db_to_excel():
 
 
 # =========================================================
+# 3-1. HWP 업로드 자동 처리 파이프라인 (HWP -> TXT -> CSV -> DB)
+# =========================================================
+# 파일명 가이드라인: "규정명_전문_YYYYMMDD.hwp"
+#  - YYYYMMDD(8자리 개정일자)는 DB 등록에 반드시 필요합니다.
+#  - '_전문_' 구분자를 사용하면 규정명이 정확하게 추출됩니다.
+FILENAME_GUIDE = "규정명_전문_YYYYMMDD.hwp"
+FILENAME_EXAMPLE = "유가증권시장 업무규정_전문_20240315.hwp"
+
+
+def validate_hwp_filename(filename: str):
+    """업로드된 HWP 파일명이 DB 등록 요건(8자리 개정일자 포함)을 만족하는지 검증."""
+    name = unicodedata.normalize('NFC', os.path.splitext(os.path.basename(filename))[0])
+    if not re.search(r'\d{8}', name):
+        return False, "파일명에 개정일자(YYYYMMDD, 8자리 숫자)가 없습니다."
+    return True, ""
+
+
+def convert_single_hwp_to_txt(hwp_path: Path):
+    """단일 HWP 파일을 TXT로 변환. 성공 시 (txt_path, None), 실패 시 (None, 에러메시지)."""
+    txt_path = hwp_path.with_suffix(".txt")
+    original_argv = sys.argv
+    sys.argv = ['hwp5txt', '--output', str(txt_path), str(hwp_path)]
+    try:
+        hwp5.hwp5txt.main()
+        return txt_path, None
+    except SystemExit as e:
+        if e.code == 0 or e.code is None:
+            return txt_path, None
+        return None, f"변환 실패 (에러 코드: {e.code})"
+    except Exception as e:
+        return None, f"알 수 없는 오류: {e}"
+    finally:
+        sys.argv = original_argv
+
+
+def load_single_csv(filepath: str):
+    """단일 CSV를 DB에 증분 적재. 반환: {'status': inserted|skipped|error, ...}"""
+    init_db()
+    reg_name, reg_date = parse_filename_info(filepath)
+    if not reg_date:
+        return {"status": "error", "message": "파일명에서 개정일자를 찾을 수 없습니다."}
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT 1 FROM regulation_history WHERE regulation_name=? AND reg_date=? LIMIT 1",
+        (reg_name, reg_date),
+    )
+    if cursor.fetchone():
+        conn.close()
+        return {"status": "skipped", "reg_name": reg_name, "reg_date": reg_date}
+
+    try:
+        df = pd.read_csv(filepath)
+        if df.empty:
+            conn.close()
+            return {"status": "error", "message": "파싱 결과가 0건입니다. 원본 파일 형식을 확인해주세요."}
+
+        df['unique_key'] = df.apply(generate_key, axis=1)
+        batch = [
+            (reg_name, reg_date, row['unique_key'],
+             row.get('참조번호', ''), row.get('조명', ''), str(row.get('내용', '')))
+            for _, row in df.iterrows()
+        ]
+        cursor.executemany('''
+            INSERT OR IGNORE INTO regulation_history
+            (regulation_name, reg_date, unique_key, ref_no, article_title, content)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', batch)
+        conn.commit()
+        conn.close()
+        get_regulation_names.clear()
+        get_regulation_dates.clear()
+        return {"status": "inserted", "reg_name": reg_name, "reg_date": reg_date, "rows": len(batch)}
+    except Exception as e:
+        conn.close()
+        return {"status": "error", "message": str(e)}
+
+
+def process_uploaded_hwp(uploaded_file):
+    """업로드된 HWP 한 개를 HWP -> TXT -> CSV -> DB 까지 자동 처리."""
+    filename = unicodedata.normalize('NFC', uploaded_file.name)
+    result = {"filename": filename}
+
+    # 1. 파일명 검증 (개정일자 필수)
+    ok, msg = validate_hwp_filename(filename)
+    if not ok:
+        result.update(status="error", message=msg)
+        return result
+
+    # 2. 규정 폴더에 원본 저장
+    os.makedirs(DATA_DIR, exist_ok=True)
+    hwp_path = Path(DATA_DIR) / filename
+    try:
+        with open(hwp_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+    except Exception as e:
+        result.update(status="error", message=f"파일 저장 실패: {e}")
+        return result
+
+    # 3. HWP -> TXT
+    txt_path, err = convert_single_hwp_to_txt(hwp_path)
+    if err:
+        result.update(status="error", message=f"HWP→TXT 변환 실패: {err}")
+        return result
+
+    # 4. TXT -> CSV
+    try:
+        text = read_source_text(str(txt_path))
+        df = parse_all(text)
+        csv_path = txt_path.with_suffix(".csv")
+        df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    except Exception as e:
+        result.update(status="error", message=f"TXT→CSV 변환 실패: {e}")
+        return result
+
+    # 5. DB 적재
+    load_res = load_single_csv(str(csv_path))
+    result.update(load_res)
+    return result
+
+
+# =========================================================
 # 4. 메인 UI 구성
 # =========================================================
 st.set_page_config(page_title="금융 규정 검색 시스템", layout="wide", page_icon="⚡")
 
 with st.sidebar:
-    st.header("⚙️ 관리 및 메뉴")
-    
-    # --- 원본 파일 처리 (HWP -> TXT -> CSV) ---
-    st.markdown("**(1) 원본 파일 처리**")
-    
-    # [추가됨] HWP -> TXT 변환 버튼
-    if st.button("📄 HWP -> TXT 변환"):
-        if not HAS_PYHWP:
-            st.error("pyhwp 라이브러리가 설치되어 있지 않습니다. 터미널에서 'pip install pyhwp'를 실행해주세요.")
-        else:
-            with st.spinner("HWP 파일을 파싱하여 TXT로 변환 중입니다..."):
-                conv, skip, err, msg = convert_hwp_to_txt_st()
+    # =====================================================
+    # 관리 메뉴 (접기 가능) — 접어두면 아래 '기능 선택'이 잘 보입니다.
+    # =====================================================
+    with st.expander("⚙️ 관리 메뉴 (HWP 업로드 · DB 등록 · 내보내기)", expanded=False):
+
+        # --- HWP 업로드 → 자동 DB 등록 (원스톱) ---
+        st.markdown("**(0) HWP 업로드 → 자동 DB 등록**")
+
+        # (참고) st.expander 는 중첩할 수 없으므로 체크박스로 가이드라인을 토글합니다.
+        if st.checkbox("📋 파일명 가이드라인 보기 (필독)"):
+            st.markdown(
+                f"""
+                업로드 시 파일명에서 **규정명**과 **개정일자**를 자동으로 추출합니다.
+                아래 형식을 지켜주세요.
+
+                **권장 형식**
+                ```
+                {FILENAME_GUIDE}
+                ```
+                **예시**
+                ```
+                {FILENAME_EXAMPLE}
+                ```
+
+                - `YYYYMMDD` : 개정일자 8자리 숫자 (예: `20240315`) — **필수**
+                - `_전문_` : 규정명과 일자를 구분 (권장). 규정명이 정확히 추출됩니다.
+                - 8자리 개정일자가 없으면 등록되지 않습니다.
+                - 동일한 (규정명, 개정일자)는 중복 등록되지 않고 건너뜁니다.
+                """
+            )
+
+        uploaded_hwps = st.file_uploader(
+            "HWP 파일 업로드 (여러 개 가능)",
+            type=["hwp"],
+            accept_multiple_files=True,
+            help=f"권장 형식: {FILENAME_GUIDE}",
+        )
+
+        if st.button("🚀 업로드 파일 자동 처리", type="primary"):
+            if not HAS_PYHWP:
+                st.error("pyhwp 라이브러리가 설치되어 있지 않습니다. 터미널에서 'pip install pyhwp'를 실행해주세요.")
+            elif not uploaded_hwps:
+                st.warning("먼저 HWP 파일을 업로드해주세요.")
+            else:
+                ins = skip = errs = 0
+                progress_bar = st.progress(0)
+                for i, uf in enumerate(uploaded_hwps):
+                    with st.spinner(f"처리 중: {uf.name}"):
+                        res = process_uploaded_hwp(uf)
+                    status = res.get("status")
+                    if status == "inserted":
+                        ins += 1
+                        st.success(f"✅ [{res['reg_name']}] {res['reg_date']} 등록 완료 ({res.get('rows', 0)}건)")
+                    elif status == "skipped":
+                        skip += 1
+                        st.info(f"⏭️ [{res['reg_name']}] {res['reg_date']} — 이미 등록되어 건너뜀")
+                    else:
+                        errs += 1
+                        st.error(f"❌ {res['filename']} — {res.get('message', '알 수 없는 오류')}")
+                    progress_bar.progress((i + 1) / len(uploaded_hwps))
+                progress_bar.empty()
+                st.success(f"자동 처리 완료! (신규 {ins} / 건너뜀 {skip} / 오류 {errs})")
+
+        st.markdown("---")
+
+        # --- 원본 파일 처리 (HWP -> TXT -> CSV) ---
+        st.markdown("**(1) 원본 파일 처리 (수동/일괄)**")
+
+        # [추가됨] HWP -> TXT 변환 버튼
+        if st.button("📄 HWP -> TXT 변환"):
+            if not HAS_PYHWP:
+                st.error("pyhwp 라이브러리가 설치되어 있지 않습니다. 터미널에서 'pip install pyhwp'를 실행해주세요.")
+            else:
+                with st.spinner("HWP 파일을 파싱하여 TXT로 변환 중입니다..."):
+                    conv, skip, err, msg = convert_hwp_to_txt_st()
+                    if conv == -1:
+                        st.warning(msg)
+                    elif conv == 0 and skip == 0:
+                        st.info(msg)
+                    else:
+                        st.success(f"HWP->TXT 변환 완료! (신규: {conv}개, 건너뜀: {skip}개, 오류: {err}개)")
+
+        if st.button("📄 TXT -> CSV 변환"):
+            with st.spinner("TXT 파일을 파싱하여 CSV로 변환 중입니다..."):
+                conv, skip, err, msg = convert_txt_files_to_csv()
                 if conv == -1:
                     st.warning(msg)
                 elif conv == 0 and skip == 0:
                     st.info(msg)
                 else:
-                    st.success(f"HWP->TXT 변환 완료! (신규: {conv}개, 건너뜀: {skip}개, 오류: {err}개)")
+                    st.success(f"TXT->CSV 변환 완료! (신규: {conv}개, 건너뜀: {skip}개, 오류: {err}개)")
 
-    if st.button("📄 TXT -> CSV 변환"):
-        with st.spinner("TXT 파일을 파싱하여 CSV로 변환 중입니다..."):
-            conv, skip, err, msg = convert_txt_files_to_csv()
-            if conv == -1:
-                st.warning(msg)
-            elif conv == 0 and skip == 0:
-                st.info(msg)
+        st.markdown("**(2) 시스템 DB 등록**")
+        if st.button("🔄 DB 업데이트 (증분)"):
+            with st.spinner(f"'{DATA_DIR}' 폴더 스캔 중..."):
+                cnt, skip = load_files()
+
+            if cnt == -1:
+                st.warning(f"폴더가 생성되었습니다. CSV 파일을 '{DATA_DIR}'에 넣어주세요.")
             else:
-                st.success(f"TXT->CSV 변환 완료! (신규: {conv}개, 건너뜀: {skip}개, 오류: {err}개)")
-    
-    st.markdown("**(2) 시스템 DB 등록**")
-    if st.button("🔄 DB 업데이트 (증분)"):
-        with st.spinner(f"'{DATA_DIR}' 폴더 스캔 중..."):
-            cnt, skip = load_files()
-        
-        if cnt == -1:
-            st.warning(f"폴더가 생성되었습니다. CSV 파일을 '{DATA_DIR}'에 넣어주세요.")
-        else:
-            st.success(f"DB 업데이트 완료! (신규: {cnt}개, 건너뜀: {skip}개)")
-    
-    st.write("")
-    st.markdown("**(3) 데이터 내보내기**")
-    if st.button("📥 DB 전체 엑셀 다운로드 준비"):
-        with st.spinner("엑셀 파일 생성 중... (데이터 양에 따라 시간이 걸릴 수 있습니다)"):
-            if os.path.exists(DB_FILE):
-                excel_data = export_db_to_excel()
-                if excel_data:
-                    st.download_button(
-                        label="💾 엑셀 파일 다운로드",
-                        data=excel_data,
-                        file_name="regulation_db_dump.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                else:
-                    st.error("오류 발생")
+                st.success(f"DB 업데이트 완료! (신규: {cnt}개, 건너뜀: {skip}개)")
 
-    st.markdown("---")
+        st.write("")
+        st.markdown("**(3) 데이터 내보내기**")
+        if st.button("📥 DB 전체 엑셀 다운로드 준비"):
+            with st.spinner("엑셀 파일 생성 중... (데이터 양에 따라 시간이 걸릴 수 있습니다)"):
+                if os.path.exists(DB_FILE):
+                    excel_data = export_db_to_excel()
+                    if excel_data:
+                        st.download_button(
+                            label="💾 엑셀 파일 다운로드",
+                            data=excel_data,
+                            file_name="regulation_db_dump.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                    else:
+                        st.error("오류 발생")
+
+    # =====================================================
+    # 기능 선택 (항상 노출 — 사용자가 바로 접근)
+    # =====================================================
     st.header("🔍 기능 선택")
     menu = st.radio("메뉴 선택", list(MENU_NAMES.values()))
 
