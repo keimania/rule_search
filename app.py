@@ -180,7 +180,7 @@ def parse_h_block(article_id: str, title: str, h_char: str, block_raw: str):
         if mok_matches: ho_main = remainder[: mok_matches[0].start(0)].strip()
         else: ho_main = remainder.strip()
 
-        base_ref = f"{article_id}제{ho_num}호"
+        base_ref = f"{article_id}제{h_char}항제{ho_num}호"
         rows.append({
             "참조번호": base_ref, "조": article_id, "조명": title,
             "항": h_char, "호": ho_num, "목": "0", "내용": ho_main

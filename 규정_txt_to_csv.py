@@ -115,7 +115,7 @@ def parse_h_block(article_id: str, title: str, h_char: str, block_raw: str):
         else:
             ho_main = remainder.strip()
 
-        base_ref = f"{article_id}제{ho_num}호"
+        base_ref = f"{article_id}제{h_char}항제{ho_num}호"
         rows.append({
             "참조번호": base_ref, "조": article_id, "조명": title,
             "항": h_char, "호": ho_num, "목": "0", "내용": ho_main
@@ -322,8 +322,8 @@ def build_stats(df: pd.DataFrame) -> pd.DataFrame:
     hang_set = set()
     ho_set = set()
     for _, row in df.iterrows():
-        if row["항"] != "0": hang_set.add((row["참조번호"], row["항"]))
-        if row["호"] != "0": ho_set.add((row["참조번호"], row["항"], row["호"]))
+        if row["항"] != "0": hang_set.add((row["조"], row["항"]))
+        if row["호"] != "0": ho_set.add((row["조"], row["항"], row["호"]))
 
     stats_df = pd.DataFrame({
         "구분": ["항 개수", "호 개수", "총 항목 수"],
@@ -336,6 +336,8 @@ def build_stats(df: pd.DataFrame) -> pd.DataFrame:
 # 8. 메인 실행부 (폴더 경로 수정 및 스킵 로직 추가)
 # ----------------------------------------------------------------------
 def main():
+    force = "--force" in sys.argv or "-f" in sys.argv
+
     # "규정" 폴더를 타겟으로 설정
     target_dir = Path("규정")
 
@@ -359,7 +361,7 @@ def main():
         output_csv_path = txt_path.with_suffix(".csv")
 
         # 4. 동일한 이름의 csv 파일이 이미 존재하는지 확인 (추가된 부분)
-        if output_csv_path.exists():
+        if output_csv_path.exists() and not force:
             print(f">> 건너뜀: {output_csv_path.name} 파일이 이미 존재합니다.")
             continue # 파일이 있으면 처리하지 않고 다음으로 넘어감
 
