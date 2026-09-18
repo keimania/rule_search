@@ -407,28 +407,103 @@ def convert_txt_files_to_csv():
 # =========================================================
 # 3. DB 핸들링 및 최적화 함수
 # =========================================================
+def get_db_url():
+    """Supabase PostgreSQL 연결 URL 확인 (Streamlit secrets 또는 환경 변수)"""
+    try:
+        if "SUPABASE_DB_URL" in st.secrets:
+            return st.secrets["SUPABASE_DB_URL"]
+        if "database" in st.secrets and "url" in st.secrets["database"]:
+            return st.secrets["database"]["url"]
+    except Exception:
+        pass
+    return os.environ.get("SUPABASE_DB_URL", "")
+
+@st.cache_resource(ttl=300)
+def check_postgres_available():
+    db_url = get_db_url()
+    if not db_url:
+        return False
+    try:
+        import psycopg2
+        conn = psycopg2.connect(db_url, connect_timeout=4)
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+def is_postgres():
+    return check_postgres_available()
+
+def sql_ph(query: str) -> str:
+    """PostgreSQL에서는 %s, SQLite에서는 ? 로 플레이스홀더 변환"""
+    if is_postgres():
+        return query.replace("?", "%s")
+    return query
+
 def get_connection():
+    db_url = get_db_url()
+    if db_url:
+        try:
+            import psycopg2
+            return psycopg2.connect(db_url)
+        except Exception:
+            pass
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
+def _insert_history_batch(cursor, batch_data):
+    """PostgreSQL(Supabase) 및 SQLite 양쪽의 배치 삽입 호환 함수"""
+    if not batch_data:
+        return
+    if is_postgres():
+        from psycopg2.extras import execute_values
+        query = '''
+            INSERT INTO regulation_history 
+            (regulation_name, reg_date, unique_key, ref_no, article_title, content) 
+            VALUES %s
+            ON CONFLICT (regulation_name, reg_date, unique_key) DO NOTHING
+        '''
+        execute_values(cursor, query, batch_data, page_size=len(batch_data))
+    else:
+        cursor.executemany('''
+            INSERT OR IGNORE INTO regulation_history 
+            (regulation_name, reg_date, unique_key, ref_no, article_title, content) 
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', batch_data)
+
 def init_db():
     conn = get_connection()
     cursor = conn.cursor()
     
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS regulation_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            regulation_name TEXT,
-            reg_date TEXT,
-            unique_key TEXT,
-            ref_no TEXT,
-            article_title TEXT,
-            content TEXT,
-            UNIQUE(regulation_name, reg_date, unique_key)
-        )
-    ''')
+    if is_postgres():
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS regulation_history (
+                id BIGSERIAL PRIMARY KEY,
+                regulation_name TEXT NOT NULL,
+                reg_date VARCHAR(8) NOT NULL,
+                unique_key TEXT NOT NULL,
+                ref_no TEXT,
+                article_title TEXT,
+                content TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                CONSTRAINT uq_reg_date_key UNIQUE(regulation_name, reg_date, unique_key)
+            )
+        ''')
+    else:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS regulation_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                regulation_name TEXT,
+                reg_date TEXT,
+                unique_key TEXT,
+                ref_no TEXT,
+                article_title TEXT,
+                content TEXT,
+                UNIQUE(regulation_name, reg_date, unique_key)
+            )
+        ''')
     
     indexes = [
         "CREATE INDEX IF NOT EXISTS idx_reg_name ON regulation_history(regulation_name);",
@@ -442,7 +517,7 @@ def init_db():
 
 @st.cache_data(ttl=3600) 
 def get_regulation_names():
-    if not os.path.exists(DB_FILE): return []
+    if not is_postgres() and not os.path.exists(DB_FILE): return []
     conn = get_connection()
     try:
         df = pd.read_sql("SELECT DISTINCT regulation_name FROM regulation_history ORDER BY regulation_name", conn)
@@ -454,7 +529,8 @@ def get_regulation_names():
 def get_regulation_dates(reg_name):
     conn = get_connection()
     try:
-        dates = pd.read_sql("SELECT DISTINCT reg_date FROM regulation_history WHERE regulation_name=? ORDER BY reg_date DESC", conn, params=(reg_name,))
+        q = sql_ph("SELECT DISTINCT reg_date FROM regulation_history WHERE regulation_name=? ORDER BY reg_date DESC")
+        dates = pd.read_sql(q, conn, params=(reg_name,))
         return dates['reg_date'].tolist()
     finally: conn.close()
 
@@ -518,11 +594,7 @@ def load_files():
                 ))
             
             if len(batch_data) >= 1000:
-                cursor.executemany('''
-                    INSERT OR IGNORE INTO regulation_history 
-                    (regulation_name, reg_date, unique_key, ref_no, article_title, content) 
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', batch_data)
+                _insert_history_batch(cursor, batch_data)
                 batch_data = []
             
             count += 1
@@ -530,11 +602,7 @@ def load_files():
             pass
             
     if batch_data:
-        cursor.executemany('''
-            INSERT OR IGNORE INTO regulation_history 
-            (regulation_name, reg_date, unique_key, ref_no, article_title, content) 
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', batch_data)
+        _insert_history_batch(cursor, batch_data)
         
     conn.commit()
     conn.close()
@@ -547,15 +615,20 @@ def load_files():
 def export_db_to_excel():
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-    tables = cursor.fetchall()
+    if is_postgres():
+        cursor.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';")
+        tables = cursor.fetchall()
+    else:
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = cursor.fetchall()
     
     output = io.BytesIO()
     try:
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             for table_name in tables:
                 t_name = table_name[0]
-                df = pd.read_sql(f"SELECT * FROM {t_name}", conn)
+                if t_name == 'sqlite_sequence': continue
+                df = pd.read_sql(f'SELECT * FROM "{t_name}" ORDER BY id', conn)
                 df.to_excel(writer, sheet_name=t_name, index=False)
     except Exception:
         conn.close()
@@ -611,7 +684,7 @@ def load_single_csv(filepath: str):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT 1 FROM regulation_history WHERE regulation_name=? AND reg_date=? LIMIT 1",
+        sql_ph("SELECT 1 FROM regulation_history WHERE regulation_name=? AND reg_date=? LIMIT 1"),
         (reg_name, reg_date),
     )
     if cursor.fetchone():
@@ -630,11 +703,7 @@ def load_single_csv(filepath: str):
              row.get('참조번호', ''), row.get('조명', ''), str(row.get('내용', '')))
             for _, row in df.iterrows()
         ]
-        cursor.executemany('''
-            INSERT OR IGNORE INTO regulation_history
-            (regulation_name, reg_date, unique_key, ref_no, article_title, content)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', batch)
+        _insert_history_batch(cursor, batch)
         conn.commit()
         conn.close()
         get_regulation_names.clear()
@@ -800,7 +869,7 @@ with st.sidebar:
         st.markdown("**(3) 데이터 내보내기**")
         if st.button("📥 DB 전체 엑셀 다운로드 준비"):
             with st.spinner("엑셀 파일 생성 중... (데이터 양에 따라 시간이 걸릴 수 있습니다)"):
-                if os.path.exists(DB_FILE):
+                if is_postgres() or os.path.exists(DB_FILE):
                     excel_data = export_db_to_excel()
                     if excel_data:
                         st.download_button(
@@ -811,6 +880,12 @@ with st.sidebar:
                         )
                     else:
                         st.error("오류 발생")
+
+        st.markdown("---")
+        if is_postgres():
+            st.caption("🟢 **DB 연결**: Supabase (PostgreSQL)")
+        else:
+            st.caption("📁 **DB 연결**: 로컬 SQLite (오프라인)")
 
     # =====================================================
     # 기능 선택 (항상 노출 — 사용자가 바로 접근)
@@ -852,7 +927,8 @@ elif menu == MENU_NAMES["3"]:
         
         if st.button("조회"):
             conn = get_connection()
-            df = pd.read_sql("SELECT ref_no as '조항', article_title as '조명', content as '내용' FROM regulation_history WHERE regulation_name=? AND reg_date=? ORDER BY id", conn, params=(target, date))
+            q = sql_ph('SELECT ref_no as "조항", article_title as "조명", content as "내용" FROM regulation_history WHERE regulation_name=? AND reg_date=? ORDER BY id')
+            df = pd.read_sql(q, conn, params=(target, date))
             conn.close()
             st.dataframe(df, width='stretch', height=600)
 
@@ -865,7 +941,8 @@ elif menu == MENU_NAMES["4"]:
         
         if st.button("히스토리 검색"):
             conn = get_connection()
-            df = pd.read_sql("SELECT reg_date, ref_no, article_title, content, unique_key FROM regulation_history WHERE regulation_name=? AND ref_no LIKE ? ORDER BY unique_key, reg_date", conn, params=(target, f"%{ref}%"))
+            q = sql_ph("SELECT reg_date, ref_no, article_title, content, unique_key FROM regulation_history WHERE regulation_name=? AND ref_no LIKE ? ORDER BY unique_key, reg_date")
+            df = pd.read_sql(q, conn, params=(target, f"%{ref}%"))
             conn.close()
             
             if df.empty: st.warning("결과가 없습니다.")
@@ -894,24 +971,26 @@ elif menu == MENU_NAMES["5"]:
         
         if st.button("조회"):
             conn = get_connection()
-            df = pd.read_sql("""
-                SELECT ref_no AS '조항', article_title AS '조명', content AS '내용' 
+            q = sql_ph("""
+                SELECT ref_no AS "조항", article_title AS "조명", content AS "내용" 
                 FROM regulation_history 
                 WHERE regulation_name=? AND reg_date=? AND ref_no LIKE ?
-            """, conn, params=(target, date, f"%{ref}%"))
+            """)
+            df = pd.read_sql(q, conn, params=(target, date, f"%{ref}%"))
             conn.close()
             st.table(df)
 
 elif menu == MENU_NAMES["6"]:
     st.subheader("🔍 통합 키워드 검색")
     if reg_names:
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            target = st.selectbox("대상", ["전체 규정 (All)"] + reg_names, index=0)
-            latest = st.checkbox("최신 규정만", value=True)
-        with c2:
-            keyword = st.text_input("검색어", placeholder="예: 공매도")
-            btn = st.button("검색")
+        with st.form("keyword_search_form", border=False):
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                target = st.selectbox("대상", ["전체 규정 (All)"] + reg_names, index=0)
+                latest = st.checkbox("최신 규정만", value=True)
+            with c2:
+                keyword = st.text_input("검색어", placeholder="예: 공매도")
+                btn = st.form_submit_button("검색", type="primary")
 
         if btn and keyword:
             conn = get_connection()
@@ -931,7 +1010,7 @@ elif menu == MENU_NAMES["6"]:
                 """
             q += " ORDER BY regulation_name, reg_date DESC, id"
             
-            df = pd.read_sql(q, conn, params=p)
+            df = pd.read_sql(sql_ph(q), conn, params=p)
             conn.close()
             
             if df.empty: st.warning("결과 없음")
@@ -943,20 +1022,23 @@ elif menu == MENU_NAMES["6"]:
                     with st.container(border=True):
                         st.markdown(f"**📌 [{row['regulation_name']}] {row['ref_no']} {row['article_title']}** :grey[{row['reg_date']}]")
                         st.markdown(row['content'].replace(keyword, f":red[**{keyword}**]"))
+        elif btn and not keyword:
+            st.warning("검색어를 입력해주세요.")
 
 elif menu == MENU_NAMES["7"]:
     st.subheader("🔗 조항 인용 및 역참조 분석")
     st.info("특정 규정의 조항이 내/외부에서 어떻게 인용되고 있는지 분석합니다.")
     
     if reg_names:
-        col1, col2 = st.columns(2)
-        with col1:
-            target_reg = st.selectbox("관심 규정", reg_names, index=default_reg_index)
-        with col2:
-            target_art = st.text_input("관심 조항 번호", value=DEFAULT_ART_NO)
-            
-        latest_only = st.checkbox("최신 규정 내용에서만 찾기 (권장)", value=True)
-        search_btn = st.button("인용 분석 시작", type="primary")
+        with st.form("ref_analysis_form", border=False):
+            col1, col2 = st.columns(2)
+            with col1:
+                target_reg = st.selectbox("관심 규정", reg_names, index=default_reg_index)
+            with col2:
+                target_art = st.text_input("관심 조항 번호", value=DEFAULT_ART_NO)
+                
+            latest_only = st.checkbox("최신 규정 내용에서만 찾기 (권장)", value=True)
+            search_btn = st.form_submit_button("인용 분석 시작", type="primary")
         
         if search_btn and target_art:
             conn = get_connection()
@@ -1003,7 +1085,7 @@ elif menu == MENU_NAMES["7"]:
             else:
                 full_query = base_query + " ORDER BY regulation_name, id"
 
-            df_filtered = pd.read_sql(full_query, conn, params=params)
+            df_filtered = pd.read_sql(sql_ph(full_query), conn, params=params)
             conn.close()
             
             results_internal, results_partner, results_external = [], [], []

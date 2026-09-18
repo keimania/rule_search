@@ -2,3 +2,5 @@ streamlit
 pandas
 openpyxl
 pyhwp
+psycopg2-binary
+sqlalchemy
