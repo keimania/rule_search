@@ -41,25 +41,23 @@ def convert_all_hwp_to_txt():
 
         print(f"변환 중: {file_name} -> {os.path.basename(txt_path)}")
         
-        # 5. 파이썬 내부 모듈(hwp5txt)을 직접 호출 (subprocess 미사용)
-        # hwp5txt.main()이 인자를 읽을 수 있도록 sys.argv를 임시로 세팅합니다.
-        original_argv = sys.argv
-        sys.argv = ['hwp5txt', '--output', txt_path, hwp_path]
-        
+        # 5. pyhwp의 TextTransform 모듈을 사용하여 메모리 스트림 기반으로 안전하게 텍스트 추출 (sys.argv 미사용)
         try:
-            hwp5.hwp5txt.main()
-        except SystemExit as e:
-            # hwp5txt.main()은 작업 완료 시 sys.exit()을 호출하는 구조이므로, 
-            # 이를 예외로 잡아내어 스크립트가 완전히 종료되는 것을 방지합니다.
-            if e.code == 0 or e.code is None:
-                print("  └─ 성공")
-            else:
-                print(f"  └─ 실패 (에러 코드: {e.code})")
+            import io
+            from contextlib import closing
+            from hwp5.hwp5txt import TextTransform, Hwp5File
+
+            tt = TextTransform()
+            with closing(Hwp5File(hwp_path)) as hwp5file:
+                buf = io.BytesIO()
+                tt.transform_hwp5_to_text(hwp5file, buf)
+                text_content = buf.getvalue().decode('utf-8', errors='ignore')
+
+            with open(txt_path, 'w', encoding='utf-8') as dest:
+                dest.write(text_content)
+            print("  └─ 성공")
         except Exception as e:
-            print(f"  └─ 알 수 없는 오류: {e}")
-        finally:
-            # 다음 파일 변환을 위해 sys.argv를 원래 상태로 복구
-            sys.argv = original_argv
+            print(f"  └─ 실패: {e}")
 
     print("\n모든 작업이 완료되었습니다.")
 

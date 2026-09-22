@@ -564,6 +564,17 @@ def init_db():
                 CONSTRAINT uq_reg_date_key UNIQUE(regulation_name, reg_date, unique_key)
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS regulation_uploads (
+                id BIGSERIAL PRIMARY KEY,
+                filename TEXT NOT NULL,
+                regulation_name TEXT NOT NULL,
+                reg_date VARCHAR(8) NOT NULL,
+                clause_count INTEGER DEFAULT 0,
+                file_size INTEGER DEFAULT 0,
+                uploaded_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        ''')
     else:
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS regulation_history (
@@ -577,12 +588,24 @@ def init_db():
                 UNIQUE(regulation_name, reg_date, unique_key)
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS regulation_uploads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT,
+                regulation_name TEXT,
+                reg_date TEXT,
+                clause_count INTEGER DEFAULT 0,
+                file_size INTEGER DEFAULT 0,
+                uploaded_at TEXT DEFAULT (datetime('now', 'localtime'))
+            )
+        ''')
     
     indexes = [
         "CREATE INDEX IF NOT EXISTS idx_reg_name ON regulation_history(regulation_name);",
         "CREATE INDEX IF NOT EXISTS idx_reg_date ON regulation_history(reg_date);",
         "CREATE INDEX IF NOT EXISTS idx_ref_no ON regulation_history(ref_no);",
-        "CREATE INDEX IF NOT EXISTS idx_name_date ON regulation_history(regulation_name, reg_date);"
+        "CREATE INDEX IF NOT EXISTS idx_name_date ON regulation_history(regulation_name, reg_date);",
+        "CREATE INDEX IF NOT EXISTS idx_uploads_name ON regulation_uploads(regulation_name);"
     ]
     for idx_sql in indexes: cursor.execute(idx_sql)
     clean_legacy_regulation_names(conn)
@@ -706,9 +729,6 @@ def load_files():
     conn.commit()
     conn.close()
     
-    get_regulation_names.clear()
-    get_regulation_dates.clear()
-    
     return count, skipped
 
 def export_db_to_excel():
@@ -738,43 +758,47 @@ def export_db_to_excel():
 
 
 # =========================================================
-# 3-1. HWP 업로드 자동 처리 파이프라인 (HWP -> TXT -> CSV -> DB)
+# 3-1. 규정 파일 업로드 자동 처리 파이프라인 (HWP/TXT/CSV -> DB)
 # =========================================================
-# 파일명 가이드라인: "규정명_전문_YYYYMMDD.hwp"
+# 파일명 가이드라인: "규정명_전문_YYYYMMDD.hwp" (또는 .txt, .csv)
 #  - YYYYMMDD(8자리 개정일자)는 DB 등록에 반드시 필요합니다.
 #  - '_전문_' 구분자를 사용하면 규정명이 정확하게 추출됩니다.
-FILENAME_GUIDE = "규정명_전문_YYYYMMDD.hwp"
+FILENAME_GUIDE = "규정명_전문_YYYYMMDD.hwp (또는 .txt, .csv)"
 FILENAME_EXAMPLE = "유가증권시장 업무규정_전문_20240315.hwp"
 
 
-def validate_hwp_filename(filename: str):
-    """업로드된 HWP 파일명이 DB 등록 요건(8자리 개정일자 포함)을 만족하는지 검증."""
+def validate_regulation_filename(filename: str):
+    """업로드된 파일명이 DB 등록 요건(8자리 개정일자 포함)을 만족하는지 검증."""
     name = unicodedata.normalize('NFC', os.path.splitext(os.path.basename(filename))[0])
     if not re.search(r'\d{8}', name):
-        return False, "파일명에 개정일자(YYYYMMDD, 8자리 숫자)가 없습니다."
+        return False, "파일명에 개정일자(YYYYMMDD, 8자리 숫자)가 없습니다. (예: 규정명_전문_20240315.hwp)"
     return True, ""
+
+validate_hwp_filename = validate_regulation_filename
 
 
 def convert_single_hwp_to_txt(hwp_path: Path):
-    """단일 HWP 파일을 TXT로 변환. 성공 시 (txt_path, None), 실패 시 (None, 에러메시지)."""
+    """단일 HWP 파일을 TXT로 변환. pyhwp TextTransform 모듈을 사용하여 메모리 스트림 기반으로 안전하게 추출."""
     txt_path = hwp_path.with_suffix(".txt")
-    original_argv = sys.argv
-    sys.argv = ['hwp5txt', '--output', str(txt_path), str(hwp_path)]
     try:
-        hwp5.hwp5txt.main()
+        from contextlib import closing
+        from hwp5.hwp5txt import TextTransform, Hwp5File
+
+        tt = TextTransform()
+        with closing(Hwp5File(str(hwp_path))) as hwp5file:
+            buf = io.BytesIO()
+            tt.transform_hwp5_to_text(hwp5file, buf)
+            text_content = buf.getvalue().decode('utf-8', errors='ignore')
+
+        with open(txt_path, "w", encoding="utf-8") as dest:
+            dest.write(text_content)
         return txt_path, None
-    except SystemExit as e:
-        if e.code == 0 or e.code is None:
-            return txt_path, None
-        return None, f"변환 실패 (에러 코드: {e.code})"
     except Exception as e:
-        return None, f"알 수 없는 오류: {e}"
-    finally:
-        sys.argv = original_argv
+        return None, f"HWP 파싱 실패: {e}"
 
 
-def load_single_csv(filepath: str):
-    """단일 CSV를 DB에 증분 적재. 반환: {'status': inserted|skipped|error, ...}"""
+def load_single_csv(filepath: str, overwrite: bool = False, original_filename: str = None, file_size: int = 0):
+    """단일 CSV를 DB에 증분 적재. 반환: {'status': inserted|updated|skipped|error, ...}"""
     init_db()
     reg_name, reg_date = parse_filename_info(filepath)
     if not reg_date:
@@ -786,7 +810,8 @@ def load_single_csv(filepath: str):
         sql_ph("SELECT 1 FROM regulation_history WHERE regulation_name=? AND reg_date=? LIMIT 1"),
         (reg_name, reg_date),
     )
-    if cursor.fetchone():
+    is_existing = cursor.fetchone() is not None
+    if is_existing and not overwrite:
         conn.close()
         return {"status": "skipped", "reg_name": reg_name, "reg_date": reg_date}
 
@@ -796,64 +821,131 @@ def load_single_csv(filepath: str):
             conn.close()
             return {"status": "error", "message": "파싱 결과가 0건입니다. 원본 파일 형식을 확인해주세요."}
 
-        df['unique_key'] = df.apply(generate_key, axis=1)
+        # 조, 항, 호, 목 누락 컬럼 기본값 보정
+        for col in ['장번호', '조', '항', '호', '목']:
+            if col not in df.columns:
+                df[col] = "0"
+
+        if 'unique_key' not in df.columns:
+            df['unique_key'] = df.apply(generate_key, axis=1)
+
         batch = [
             (reg_name, reg_date, row['unique_key'],
              row.get('참조번호', ''), row.get('조명', ''), str(row.get('내용', '')))
             for _, row in df.iterrows()
         ]
+
+        # 덮어쓰기 시 기존 데이터 먼저 삭제하여 충돌 방지 및 완벽 갱신
+        if is_existing and overwrite:
+            cursor.execute(
+                sql_ph("DELETE FROM regulation_history WHERE regulation_name=? AND reg_date=?"),
+                (reg_name, reg_date)
+            )
+
         _insert_history_batch(cursor, batch)
+
+        # 영구 업로드 이력 로그 기록 (regulation_uploads)
+        try:
+            fname = original_filename or os.path.basename(filepath)
+            fsize = file_size or (os.path.getsize(filepath) if os.path.exists(filepath) else 0)
+            if is_postgres():
+                cursor.execute(
+                    "INSERT INTO regulation_uploads (filename, regulation_name, reg_date, clause_count, file_size) VALUES (%s, %s, %s, %s, %s)",
+                    (fname, reg_name, reg_date, len(batch), fsize)
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO regulation_uploads (filename, regulation_name, reg_date, clause_count, file_size) VALUES (?, ?, ?, ?, ?)",
+                    (fname, reg_name, reg_date, len(batch), fsize)
+                )
+        except Exception:
+            pass
+
         conn.commit()
         conn.close()
-        get_regulation_names.clear()
-        get_regulation_dates.clear()
-        return {"status": "inserted", "reg_name": reg_name, "reg_date": reg_date, "rows": len(batch)}
+        status_label = "updated" if (is_existing and overwrite) else "inserted"
+        return {"status": status_label, "reg_name": reg_name, "reg_date": reg_date, "rows": len(batch)}
     except Exception as e:
         conn.close()
         return {"status": "error", "message": str(e)}
 
 
-def process_uploaded_hwp(uploaded_file):
-    """업로드된 HWP 한 개를 HWP -> TXT -> CSV -> DB 까지 자동 처리."""
+def process_uploaded_file(uploaded_file, overwrite: bool = False):
+    """업로드된 파일(.hwp, .txt, .csv)을 파싱하여 DB(Supabase/SQLite)에 자동 적재."""
     filename = unicodedata.normalize('NFC', uploaded_file.name)
     result = {"filename": filename}
+    ext = os.path.splitext(filename)[1].lower()
 
     # 1. 파일명 검증 (개정일자 필수)
-    ok, msg = validate_hwp_filename(filename)
+    ok, msg = validate_regulation_filename(filename)
     if not ok:
         result.update(status="error", message=msg)
         return result
 
-    # 2. 규정 폴더에 원본 저장
+    # 2. 로컬 디스크에 임시/참고용 원본 저장
     os.makedirs(DATA_DIR, exist_ok=True)
-    hwp_path = Path(DATA_DIR) / filename
+    target_path = Path(DATA_DIR) / filename
     try:
-        with open(hwp_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+        buffer = uploaded_file.getbuffer()
+        file_size = len(buffer)
+        with open(target_path, "wb") as f:
+            f.write(buffer)
     except Exception as e:
-        result.update(status="error", message=f"파일 저장 실패: {e}")
+        result.update(status="error", message=f"파일 임시 저장 실패: {e}")
         return result
 
-    # 3. HWP -> TXT
-    txt_path, err = convert_single_hwp_to_txt(hwp_path)
-    if err:
-        result.update(status="error", message=f"HWP→TXT 변환 실패: {err}")
+    # 3. 확장자별 파싱 및 DB 적재 파이프라인
+    if ext == ".hwp":
+        if not HAS_PYHWP:
+            result.update(status="error", message="pyhwp 라이브러리가 설치되어 있지 않습니다.")
+            return result
+        txt_path, err = convert_single_hwp_to_txt(target_path)
+        if err:
+            result.update(status="error", message=f"HWP→TXT 변환 실패: {err}")
+            return result
+        try:
+            text = read_source_text(str(txt_path))
+            df = parse_all(text)
+            csv_path = txt_path.with_suffix(".csv")
+            df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        except Exception as e:
+            result.update(status="error", message=f"TXT→CSV 변환 실패: {e}")
+            return result
+        return load_single_csv(str(csv_path), overwrite=overwrite, original_filename=filename, file_size=file_size)
+
+    elif ext == ".txt":
+        try:
+            text = read_source_text(str(target_path))
+            df = parse_all(text)
+            csv_path = target_path.with_suffix(".csv")
+            df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        except Exception as e:
+            result.update(status="error", message=f"TXT→CSV 변환 실패: {e}")
+            return result
+        return load_single_csv(str(csv_path), overwrite=overwrite, original_filename=filename, file_size=file_size)
+
+    elif ext == ".csv":
+        return load_single_csv(str(target_path), overwrite=overwrite, original_filename=filename, file_size=file_size)
+
+    else:
+        result.update(status="error", message=f"지원하지 않는 파일 형식입니다: {ext} (지원: .hwp, .txt, .csv)")
         return result
 
-    # 4. TXT -> CSV
+# 기존 호출 호환성 유지
+process_uploaded_hwp = process_uploaded_file
+
+
+def get_recent_uploads(limit: int = 10):
+    """DB에 영구 기록된 최근 업로드 이력 조회"""
+    conn = get_connection()
     try:
-        text = read_source_text(str(txt_path))
-        df = parse_all(text)
-        csv_path = txt_path.with_suffix(".csv")
-        df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-    except Exception as e:
-        result.update(status="error", message=f"TXT→CSV 변환 실패: {e}")
-        return result
-
-    # 5. DB 적재
-    load_res = load_single_csv(str(csv_path))
-    result.update(load_res)
-    return result
+        q = sql_ph(f"SELECT filename, regulation_name, reg_date, clause_count, uploaded_at FROM regulation_uploads ORDER BY id DESC LIMIT {limit}")
+        df = pd.read_sql(q, conn)
+        return df
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        conn.close()
 
 
 # =========================================================
@@ -869,8 +961,10 @@ with st.sidebar:
     st.subheader("🗄️ 데이터베이스 연결 현황")
     if is_postgres():
         st.success("🟢 **온라인 DB (Supabase PostgreSQL)**")
+        st.caption("✅ 클라우드 DB 연결됨 — 업로드 시 데이터가 영구 보존됩니다.")
     else:
-        st.info("📁 **로컬 DB (SQLite)**")
+        st.warning("📁 **로컬 DB (SQLite)**")
+        st.caption("⚠️ 로컬 모드: Streamlit Cloud 배포 시 재부팅마다 초기화되므로, 영구 저장을 위해 Secrets에 SUPABASE_DB_URL을 설정해주세요.")
     st.caption(f"📊 실데이터: **{db_stats['reg_count']}개 규정** / **{db_stats['row_count']:,}건 조항**")
     st.caption("※ 모든 규정 목록과 검색은 DB 실데이터를 직접 조회합니다.")
     st.markdown("---")
@@ -881,8 +975,13 @@ with st.sidebar:
     with st.expander("📁 참고 자료 관리 (원본 파일 보관 · DB 적재)", expanded=False):
         st.caption("ℹ️ '규정' 폴더의 파일들은 원본 참고 자료 및 백업용입니다. 시스템의 모든 검색과 목록은 위 DB 실데이터를 기준으로 실시간 동작합니다.")
 
-        # --- HWP 업로드 → 자동 DB 등록 (원스톱) ---
-        st.markdown("**(1) 신규 HWP 업로드 → DB 자동 등록**")
+        # --- 파일 업로드 → 자동 DB 등록 (원스톱) ---
+        st.markdown("**(1) 신규 파일 업로드 → DB 자동 등록 (영구 저장)**")
+
+        if is_postgres():
+            st.info("💡 **Supabase 클라우드 저장**: 업로드 시 파싱된 모든 조항이 클라우드 DB에 즉시 적재되어 영구적으로 보존됩니다.")
+        else:
+            st.warning("⚠️ **주의**: 현재 로컬 SQLite 모드입니다. Streamlit Cloud에서는 재부팅 시 데이터가 소실되므로 `SUPABASE_DB_URL`을 설정하세요.")
 
         if st.checkbox("📋 파일명 가이드라인 보기 (필독)"):
             st.markdown(
@@ -901,42 +1000,53 @@ with st.sidebar:
 
                 - `YYYYMMDD` : 개정일자 8자리 숫자 (예: `20240315`) — **필수**
                 - `_전문_` : 규정명과 일자를 구분 (권장). 규정명이 정확히 추출됩니다.
+                - `.hwp`, `.txt`, `.csv` 파일 형식을 모두 지원합니다.
                 - 8자리 개정일자가 없으면 등록되지 않습니다.
-                - 동일한 (규정명, 개정일자)는 중복 등록되지 않고 건너뜁니다.
                 """
             )
 
-        uploaded_hwps = st.file_uploader(
-            "HWP 파일 업로드 (여러 개 가능)",
-            type=["hwp"],
+        overwrite_opt = st.checkbox("🔄 기존 동일 개정일자 데이터 존재 시 덮어쓰기 (업데이트)", value=False)
+
+        uploaded_files = st.file_uploader(
+            "규정 파일 업로드 (.hwp, .txt, .csv / 복수 가능)",
+            type=["hwp", "txt", "csv"],
             accept_multiple_files=True,
             help=f"권장 형식: {FILENAME_GUIDE}",
         )
 
-        if st.button("🚀 업로드 파일 자동 처리", type="primary"):
-            if not HAS_PYHWP:
-                st.error("pyhwp 라이브러리가 설치되어 있지 않습니다. 터미널에서 'pip install pyhwp'를 실행해주세요.")
-            elif not uploaded_hwps:
-                st.warning("먼저 HWP 파일을 업로드해주세요.")
+        if st.button("🚀 업로드 파일 자동 처리 및 DB 적재", type="primary"):
+            if not uploaded_files:
+                st.warning("먼저 업로드할 파일을 선택해주세요.")
             else:
-                ins = skip = errs = 0
+                ins = upd = skip = errs = 0
                 progress_bar = st.progress(0)
-                for i, uf in enumerate(uploaded_hwps):
+                for i, uf in enumerate(uploaded_files):
                     with st.spinner(f"처리 중: {uf.name}"):
-                        res = process_uploaded_hwp(uf)
+                        res = process_uploaded_file(uf, overwrite=overwrite_opt)
                     status = res.get("status")
                     if status == "inserted":
                         ins += 1
                         st.success(f"✅ [{res['reg_name']}] {res['reg_date']} 등록 완료 ({res.get('rows', 0)}건)")
+                    elif status == "updated":
+                        upd += 1
+                        st.success(f"🔄 [{res['reg_name']}] {res['reg_date']} 덮어쓰기 완료 ({res.get('rows', 0)}건)")
                     elif status == "skipped":
                         skip += 1
-                        st.info(f"⏭️ [{res['reg_name']}] {res['reg_date']} — 이미 등록되어 건너뜀")
+                        st.info(f"⏭️ [{res['reg_name']}] {res['reg_date']} — 이미 등록되어 건너뜀 (덮어쓰려면 상단 체크박스 선택)")
                     else:
                         errs += 1
                         st.error(f"❌ {res['filename']} — {res.get('message', '알 수 없는 오류')}")
-                    progress_bar.progress((i + 1) / len(uploaded_hwps))
+                    progress_bar.progress((i + 1) / len(uploaded_files))
                 progress_bar.empty()
-                st.success(f"자동 처리 완료! (신규 {ins} / 건너뜀 {skip} / 오류 {errs})")
+                st.success(f"처리 완료! (신규: {ins} / 갱신: {upd} / 건너뜀: {skip} / 오류: {errs})")
+                if ins > 0 or upd > 0:
+                    st.button("🔄 최신 데이터 즉시 반영 (새로고침)", on_click=st.rerun)
+
+        # 영구 업로드 이력 보기
+        recent_df = get_recent_uploads(5)
+        if not recent_df.empty:
+            with st.expander("📋 최근 업로드 이력 (DB 영구 기록)"):
+                st.dataframe(recent_df, hide_index=True, use_container_width=True)
 
         st.markdown("---")
 
