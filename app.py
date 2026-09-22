@@ -8,6 +8,8 @@ import io
 import sys
 from pathlib import Path
 import unicodedata
+import warnings
+warnings.filterwarnings('ignore', message='.*pandas only supports SQLAlchemy connectable.*')
 
 # pyhwp 라이브러리 내부 모듈 임포트 시도
 try:
@@ -424,21 +426,30 @@ def get_db_url():
         pass
     return os.environ.get("SUPABASE_DB_URL", "")
 
-@st.cache_resource(ttl=300)
-def check_postgres_available():
+@st.cache_resource
+def get_db_engine():
+    """SQLAlchemy 커넥션 풀 싱글톤 관리 (@st.cache_resource)"""
     db_url = get_db_url()
     if not db_url:
-        return False
+        return None
     try:
-        import psycopg2
-        conn = psycopg2.connect(db_url, connect_timeout=4)
-        conn.close()
-        return True
+        from sqlalchemy import create_engine
+        engine = create_engine(
+            db_url,
+            pool_size=5,
+            max_overflow=10,
+            pool_timeout=15,
+            pool_recycle=1800,
+            pool_pre_ping=True
+        )
+        with engine.connect() as conn:
+            pass
+        return engine
     except Exception:
-        return False
+        return None
 
 def is_postgres():
-    return check_postgres_available()
+    return get_db_engine() is not None
 
 def sql_ph(query: str) -> str:
     """PostgreSQL에서는 %s, SQLite에서는 ? 로 플레이스홀더 변환"""
@@ -447,17 +458,21 @@ def sql_ph(query: str) -> str:
     return query
 
 def get_connection():
-    db_url = get_db_url()
-    if db_url:
+    """커넥션 풀에서 DB 연결 대여 (PostgreSQL) 또는 로컬 SQLite 연결 반환"""
+    engine = get_db_engine()
+    if engine is not None:
         try:
-            import psycopg2
-            return psycopg2.connect(db_url)
+            return engine.raw_connection()
         except Exception:
             pass
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
+
+def clear_db_cache():
+    """DB 데이터 변경(업로드/삭제/동기화) 시 Streamlit 읽기 캐시 전체 무효화"""
+    st.cache_data.clear()
 
 def _insert_history_batch(cursor, batch_data):
     """PostgreSQL(Supabase) 및 SQLite 양쪽의 배치 삽입 호환 함수"""
@@ -607,13 +622,24 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_name_date ON regulation_history(regulation_name, reg_date);",
         "CREATE INDEX IF NOT EXISTS idx_uploads_name ON regulation_uploads(regulation_name);"
     ]
+    if is_postgres():
+        try:
+            cursor.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
+            indexes.extend([
+                "CREATE INDEX IF NOT EXISTS idx_reg_content_trgm ON regulation_history USING gin (content gin_trgm_ops);",
+                "CREATE INDEX IF NOT EXISTS idx_reg_title_trgm ON regulation_history USING gin (article_title gin_trgm_ops);",
+                "CREATE INDEX IF NOT EXISTS idx_reg_ref_no_trgm ON regulation_history USING gin (ref_no gin_trgm_ops);"
+            ])
+        except Exception:
+            pass
     for idx_sql in indexes: cursor.execute(idx_sql)
     clean_legacy_regulation_names(conn)
     conn.commit()
     conn.close()
 
+@st.cache_data(ttl=600)
 def get_db_stats():
-    """실시간 DB 통계 조회 (총 규정 수, 총 레코드 수)"""
+    """실시간 DB 통계 조회 (총 규정 수, 총 레코드 수) - 캐시 적용"""
     conn = get_connection()
     try:
         cursor = conn.cursor()
@@ -627,8 +653,9 @@ def get_db_stats():
     finally:
         conn.close()
 
+@st.cache_data(ttl=600)
 def get_regulation_names():
-    """DB 실데이터 기준 고유 규정명 목록 실시간 조회 (캐시 미사용으로 항상 최신 DB 반영)"""
+    """DB 실데이터 기준 고유 규정명 목록 조회 - 캐시 적용"""
     conn = get_connection()
     try:
         df = pd.read_sql("SELECT DISTINCT regulation_name FROM regulation_history ORDER BY regulation_name", conn)
@@ -638,8 +665,9 @@ def get_regulation_names():
     finally:
         conn.close()
 
+@st.cache_data(ttl=600)
 def get_regulation_dates(reg_name):
-    """DB 실데이터 기준 특정 규정의 개정일자 목록 실시간 조회"""
+    """DB 실데이터 기준 특정 규정의 개정일자 목록 조회 - 캐시 적용"""
     conn = get_connection()
     try:
         q = sql_ph("SELECT DISTINCT reg_date FROM regulation_history WHERE regulation_name=? ORDER BY reg_date DESC")
@@ -647,6 +675,20 @@ def get_regulation_dates(reg_name):
         return dates['reg_date'].tolist()
     except Exception:
         return []
+    finally:
+        conn.close()
+
+@st.cache_data(ttl=600)
+def get_clause_count(reg_name, reg_date):
+    """특정 규정/개정일자의 등록 조항 수 조회 - 캐시 적용"""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql_ph("SELECT COUNT(*) FROM regulation_history WHERE regulation_name=? AND reg_date=?"), (reg_name, reg_date))
+        r = cur.fetchone()
+        return r[0] if r else 0
+    except Exception:
+        return 0
     finally:
         conn.close()
 
@@ -739,6 +781,8 @@ def load_files():
         
     conn.commit()
     conn.close()
+    if count > 0:
+        clear_db_cache()
     
     return count, skipped
 
@@ -869,6 +913,7 @@ def load_single_csv(filepath: str, overwrite: bool = False, original_filename: s
 
         conn.commit()
         conn.close()
+        clear_db_cache()
         status_label = "updated" if (is_existing and overwrite) else "inserted"
         return {"status": status_label, "reg_name": reg_name, "reg_date": reg_date, "rows": len(batch)}
     except Exception as e:
@@ -941,8 +986,9 @@ def process_uploaded_file(uploaded_file, overwrite: bool = False):
 process_uploaded_hwp = process_uploaded_file
 
 
+@st.cache_data(ttl=600)
 def get_recent_uploads(limit: int = 10):
-    """DB에 영구 기록된 최근 업로드 이력 조회"""
+    """DB에 영구 기록된 최근 업로드 이력 조회 - 캐시 적용"""
     conn = get_connection()
     try:
         q = sql_ph(f"SELECT filename, regulation_name, reg_date, clause_count, uploaded_at FROM regulation_uploads ORDER BY id DESC LIMIT {limit}")
@@ -988,6 +1034,7 @@ def delete_regulation_revision(reg_name: str, reg_date: str, delete_local_files:
             pass
 
         conn.commit()
+        clear_db_cache()
 
         # 3. 로컬 파일 삭제 옵션 처리
         deleted_files = []
@@ -1257,19 +1304,8 @@ with st.sidebar:
             if del_dates:
                 del_reg_date = st.selectbox("삭제 대상 개정일자 선택", del_dates, key="del_date_select")
 
-                # 대상 조항 수 표시
-                target_count = 0
-                _conn = get_connection()
-                try:
-                    _cur = _conn.cursor()
-                    _cur.execute(sql_ph("SELECT COUNT(*) FROM regulation_history WHERE regulation_name=? AND reg_date=?"), (del_reg_name, del_reg_date))
-                    _r = _cur.fetchone()
-                    if _r: target_count = _r[0]
-                except Exception:
-                    pass
-                finally:
-                    _conn.close()
-
+                # 대상 조항 수 표시 (캐시 적용)
+                target_count = get_clause_count(del_reg_name, del_reg_date)
                 st.warning(f"선택 항목: **[{del_reg_name}] {del_reg_date}** (총 {target_count:,}건 조항)")
 
                 del_files_opt = st.checkbox(
@@ -1333,12 +1369,12 @@ if PREFERRED_REG_NAME in reg_names:
     default_reg_index = reg_names.index(PREFERRED_REG_NAME)
 
 # =========================================================
-# 5. 메뉴별 로직 
+# 5. 캐싱된 고속 쿼리 함수군 (@st.cache_data)
 # =========================================================
 
-if menu == MENU_NAMES["1"]:
-    st.subheader("📂 시스템 DB 등록 규정 목록 (실시간 실데이터)")
-    st.caption("※ 본 목록은 '규정' 폴더의 파일 목록이 아닌, **실제 데이터베이스(DB)에 적재된 실데이터**를 집계하여 실시간으로 표시합니다.")
+@st.cache_data(ttl=600)
+def get_menu1_summary():
+    """메뉴 1: 시스템 DB 등록 규정 요약 집계 - 캐시 적용"""
     conn = get_connection()
     try:
         q = """
@@ -1351,36 +1387,160 @@ if menu == MENU_NAMES["1"]:
             GROUP BY regulation_name
             ORDER BY regulation_name
         """
-        df_summary = pd.read_sql(q, conn)
-        if not df_summary.empty:
-            st.dataframe(df_summary, width='stretch', hide_index=True)
-            st.caption(f"📊 총 {len(df_summary)}개 규정 / {df_summary['총 조항(레코드) 수'].sum():,}건 조항 등록됨")
-        else:
-            st.info("데이터베이스에 등록된 규정 데이터가 없습니다. 사이드바의 '참고 자료 관리'에서 HWP/CSV를 DB에 등록해주세요.")
+        return pd.read_sql(q, conn)
     finally:
         conn.close()
+
+@st.cache_data(ttl=600)
+def get_menu2_history(target_reg):
+    """메뉴 2: 특정 규정의 개정 히스토리 조회 - 캐시 적용"""
+    conn = get_connection()
+    try:
+        q = sql_ph("""
+            SELECT 
+                reg_date AS "개정일자",
+                COUNT(*) AS "등록 조항 수"
+            FROM regulation_history 
+            WHERE regulation_name=? 
+            GROUP BY reg_date 
+            ORDER BY reg_date DESC
+        """)
+        return pd.read_sql(q, conn, params=(target_reg,))
+    finally:
+        conn.close()
+
+@st.cache_data(ttl=600)
+def get_menu3_full_text(target_reg, date):
+    """메뉴 3: 특정 규정 전문 조회 - 캐시 적용"""
+    conn = get_connection()
+    try:
+        q = sql_ph('SELECT ref_no as "조항", article_title as "조명", content as "내용" FROM regulation_history WHERE regulation_name=? AND reg_date=? ORDER BY id')
+        return pd.read_sql(q, conn, params=(target_reg, date))
+    finally:
+        conn.close()
+
+@st.cache_data(ttl=600)
+def get_menu4_history(target, ref):
+    """메뉴 4: 조항 변경 이력 추적 - 캐시 적용"""
+    conn = get_connection()
+    try:
+        q = sql_ph("SELECT reg_date, ref_no, article_title, content, unique_key FROM regulation_history WHERE regulation_name=? AND ref_no LIKE ? ORDER BY unique_key, reg_date")
+        return pd.read_sql(q, conn, params=(target, f"%{ref}%"))
+    finally:
+        conn.close()
+
+@st.cache_data(ttl=600)
+def get_menu5_detail(target, date, ref):
+    """메뉴 5: 특정 시점 조항 상세 조회 - 캐시 적용"""
+    conn = get_connection()
+    try:
+        q = sql_ph("""
+            SELECT ref_no AS "조항", article_title AS "조명", content AS "내용" 
+            FROM regulation_history 
+            WHERE regulation_name=? AND reg_date=? AND ref_no LIKE ?
+        """)
+        return pd.read_sql(q, conn, params=(target, date, f"%{ref}%"))
+    finally:
+        conn.close()
+
+@st.cache_data(ttl=600)
+def get_menu6_keyword_search(target, keyword, latest):
+    """메뉴 6: 통합 키워드 검색 - 캐시 적용"""
+    conn = get_connection()
+    try:
+        q = "SELECT regulation_name, reg_date, ref_no, article_title, content FROM regulation_history WHERE (content LIKE ? OR article_title LIKE ?)"
+        p = [f"%{keyword}%", f"%{keyword}%"]
+        if target != "전체 규정 (All)":
+            q += " AND regulation_name = ?"
+            p.append(target)
+        
+        if latest:
+            q += """
+                AND (regulation_name, reg_date) IN (
+                    SELECT regulation_name, MAX(reg_date)
+                    FROM regulation_history
+                    GROUP BY regulation_name
+                )
+            """
+        q += " ORDER BY regulation_name, reg_date DESC, id"
+        return pd.read_sql(sql_ph(q), conn, params=p)
+    finally:
+        conn.close()
+
+@st.cache_data(ttl=600)
+def get_menu7_reference_analysis(target_reg, target_art, latest_only):
+    """메뉴 7: 조항 인용 및 역참조 분석 - 캐시 적용"""
+    conn = get_connection()
+    try:
+        is_rule = "시행세칙" in target_reg
+        partner_reg_name = target_reg.replace(" 시행세칙", "").replace("시행세칙", "").strip() if is_rule else f"{target_reg} 시행세칙"
+
+        term_internal = target_art 
+        term_partner = f"세칙 {target_art}" if is_rule else f"규정 {target_art}"
+        term_external = f"「{target_reg}」 {target_art}"
+
+        base_query = """
+            SELECT regulation_name, reg_date, ref_no, article_title, content
+            FROM regulation_history
+            WHERE 
+               (regulation_name = ? AND content LIKE ?) OR 
+               (regulation_name LIKE ? AND content LIKE ?) OR
+               (content LIKE ?)
+        """
+        partner_like = f"%{partner_reg_name}%"
+        params = [
+            target_reg, f"%{term_internal}%",
+            partner_like, f"%{term_partner}%",
+            f"%{term_external}%"
+        ]
+        
+        if latest_only:
+            full_query = f"""
+                WITH LatestDates AS (
+                    SELECT regulation_name, MAX(reg_date) as max_date
+                    FROM regulation_history
+                    GROUP BY regulation_name
+                )
+                SELECT h.regulation_name, h.reg_date, h.ref_no, h.article_title, h.content
+                FROM regulation_history h
+                JOIN LatestDates ld ON h.regulation_name = ld.regulation_name AND h.reg_date = ld.max_date
+                WHERE 
+                   (h.regulation_name = ? AND h.content LIKE ?) OR 
+                   (h.regulation_name LIKE ? AND h.content LIKE ?) OR
+                   (h.content LIKE ?)
+                ORDER BY h.regulation_name, h.id
+            """
+        else:
+            full_query = base_query + " ORDER BY regulation_name, id"
+
+        df_res = pd.read_sql(sql_ph(full_query), conn, params=params)
+        return df_res, partner_reg_name, term_internal, term_partner, term_external
+    finally:
+        conn.close()
+
+
+# =========================================================
+# 6. 메뉴별 렌더링 로직
+# =========================================================
+
+if menu == MENU_NAMES["1"]:
+    st.subheader("📂 시스템 DB 등록 규정 목록 (실시간 실데이터)")
+    st.caption("※ 본 목록은 '규정' 폴더의 파일 목록이 아닌, **실제 데이터베이스(DB)에 적재된 실데이터**를 집계하여 실시간으로 표시합니다.")
+    df_summary = get_menu1_summary()
+    if not df_summary.empty:
+        st.dataframe(df_summary, width='stretch', hide_index=True)
+        st.caption(f"📊 총 {len(df_summary)}개 규정 / {df_summary['총 조항(레코드) 수'].sum():,}건 조항 등록됨")
+    else:
+        st.info("데이터베이스에 등록된 규정 데이터가 없습니다. 사이드바의 '참고 자료 관리'에서 HWP/CSV를 DB에 등록해주세요.")
 
 elif menu == MENU_NAMES["2"]:
     st.subheader("📅 규정별 개정 히스토리 (실시간 실데이터)")
     st.caption("※ 선택한 규정의 **실제 DB 적재 개정본** 목록 및 각 개정본별 조항 수를 실시간 표시합니다.")
     if reg_names:
         target = st.selectbox("규정 선택", reg_names, index=default_reg_index)
-        conn = get_connection()
-        try:
-            q = sql_ph("""
-                SELECT 
-                    reg_date AS "개정일자",
-                    COUNT(*) AS "등록 조항 수"
-                FROM regulation_history 
-                WHERE regulation_name=? 
-                GROUP BY reg_date 
-                ORDER BY reg_date DESC
-            """)
-            df_dates = pd.read_sql(q, conn, params=(target,))
-            st.write(f"**{target}** 개정일 목록 (DB 실데이터 기준 총 {len(df_dates)}개 개정본):")
-            st.dataframe(df_dates, width='stretch', hide_index=True)
-        finally:
-            conn.close()
+        df_dates = get_menu2_history(target)
+        st.write(f"**{target}** 개정일 목록 (DB 실데이터 기준 총 {len(df_dates)}개 개정본):")
+        st.dataframe(df_dates, width='stretch', hide_index=True)
     else:
         st.info("데이터가 없습니다.")
 
@@ -1393,10 +1553,7 @@ elif menu == MENU_NAMES["3"]:
         with c2: date = st.selectbox("날짜", dates) if dates else st.selectbox("날짜", [])
         
         if st.button("조회"):
-            conn = get_connection()
-            q = sql_ph('SELECT ref_no as "조항", article_title as "조명", content as "내용" FROM regulation_history WHERE regulation_name=? AND reg_date=? ORDER BY id')
-            df = pd.read_sql(q, conn, params=(target, date))
-            conn.close()
+            df = get_menu3_full_text(target, date)
             st.dataframe(df, width='stretch', height=600)
     else:
         st.info("데이터베이스에 등록된 규정 데이터가 없습니다.")
@@ -1409,11 +1566,7 @@ elif menu == MENU_NAMES["4"]:
         with c2: ref = st.text_input("조항 번호", value=DEFAULT_ART_NO)
         
         if st.button("히스토리 검색"):
-            conn = get_connection()
-            q = sql_ph("SELECT reg_date, ref_no, article_title, content, unique_key FROM regulation_history WHERE regulation_name=? AND ref_no LIKE ? ORDER BY unique_key, reg_date")
-            df = pd.read_sql(q, conn, params=(target, f"%{ref}%"))
-            conn.close()
-            
+            df = get_menu4_history(target, ref)
             if df.empty: st.warning("결과가 없습니다.")
             else:
                 for r_no, group in df.groupby('ref_no'):
@@ -1441,14 +1594,7 @@ elif menu == MENU_NAMES["5"]:
         with c3: ref = st.text_input("조항 번호", value=DEFAULT_ART_NO)
         
         if st.button("조회"):
-            conn = get_connection()
-            q = sql_ph("""
-                SELECT ref_no AS "조항", article_title AS "조명", content AS "내용" 
-                FROM regulation_history 
-                WHERE regulation_name=? AND reg_date=? AND ref_no LIKE ?
-            """)
-            df = pd.read_sql(q, conn, params=(target, date, f"%{ref}%"))
-            conn.close()
+            df = get_menu5_detail(target, date, ref)
             st.table(df)
     else:
         st.info("데이터베이스에 등록된 규정 데이터가 없습니다.")
@@ -1466,26 +1612,7 @@ elif menu == MENU_NAMES["6"]:
                 btn = st.form_submit_button("검색", type="primary")
 
         if btn and keyword:
-            conn = get_connection()
-            q = "SELECT regulation_name, reg_date, ref_no, article_title, content FROM regulation_history WHERE (content LIKE ? OR article_title LIKE ?)"
-            p = [f"%{keyword}%", f"%{keyword}%"]
-            if target != "전체 규정 (All)":
-                q += " AND regulation_name = ?"
-                p.append(target)
-            
-            if latest:
-                q += """
-                    AND (regulation_name, reg_date) IN (
-                        SELECT regulation_name, MAX(reg_date)
-                        FROM regulation_history
-                        GROUP BY regulation_name
-                    )
-                """
-            q += " ORDER BY regulation_name, reg_date DESC, id"
-            
-            df = pd.read_sql(sql_ph(q), conn, params=p)
-            conn.close()
-            
+            df = get_menu6_keyword_search(target, keyword, latest)
             if df.empty: st.warning("결과 없음")
             else:
                 st.success(f"총 {len(df)}건 검색됨")
@@ -1516,52 +1643,7 @@ elif menu == MENU_NAMES["7"]:
             search_btn = st.form_submit_button("인용 분석 시작", type="primary")
         
         if search_btn and target_art:
-            conn = get_connection()
-            
-            is_rule = "시행세칙" in target_reg
-            partner_reg_name = target_reg.replace(" 시행세칙", "").replace("시행세칙", "").strip() if is_rule else f"{target_reg} 시행세칙"
-
-            term_internal = target_art 
-            term_partner = f"세칙 {target_art}" if is_rule else f"규정 {target_art}"
-            term_external = f"「{target_reg}」 {target_art}"
-
-            base_query = """
-                SELECT regulation_name, reg_date, ref_no, article_title, content
-                FROM regulation_history
-                WHERE 
-                   (regulation_name = ? AND content LIKE ?) OR 
-                   (regulation_name LIKE ? AND content LIKE ?) OR
-                   (content LIKE ?)
-            """
-            
-            partner_like = f"%{partner_reg_name}%"
-            params = [
-                target_reg, f"%{term_internal}%",
-                partner_like, f"%{term_partner}%",
-                f"%{term_external}%"
-            ]
-            
-            if latest_only:
-                full_query = f"""
-                    WITH LatestDates AS (
-                        SELECT regulation_name, MAX(reg_date) as max_date
-                        FROM regulation_history
-                        GROUP BY regulation_name
-                    )
-                    SELECT h.regulation_name, h.reg_date, h.ref_no, h.article_title, h.content
-                    FROM regulation_history h
-                    JOIN LatestDates ld ON h.regulation_name = ld.regulation_name AND h.reg_date = ld.max_date
-                    WHERE 
-                       (h.regulation_name = ? AND h.content LIKE ?) OR 
-                       (h.regulation_name LIKE ? AND h.content LIKE ?) OR
-                       (h.content LIKE ?)
-                    ORDER BY h.regulation_name, h.id
-                """
-            else:
-                full_query = base_query + " ORDER BY regulation_name, id"
-
-            df_filtered = pd.read_sql(sql_ph(full_query), conn, params=params)
-            conn.close()
+            df_filtered, partner_reg_name, term_internal, term_partner, term_external = get_menu7_reference_analysis(target_reg, target_art, latest_only)
             
             results_internal, results_partner, results_external = [], [], []
             
