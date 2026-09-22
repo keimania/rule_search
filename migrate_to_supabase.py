@@ -7,11 +7,21 @@ SQLite (regulation_master.db) -> Supabase (PostgreSQL) 일괄 마이그레이션
 import os
 import sys
 import time
+import re
+import unicodedata
 import sqlite3
 import psycopg2
 from psycopg2.extras import execute_values
 
 DB_FILE = "regulation_master.db"
+
+def normalize_regulation_name(name: str) -> str:
+    if not name:
+        return ""
+    name = unicodedata.normalize('NFC', name)
+    s = re.sub(r'[_ ]*전문(?=(_|\s|$))', '', name)
+    s = re.sub(r'[_ ]*(개정문|일부개정)(?=(_|\s|$))', '', s)
+    return unicodedata.normalize('NFC', s.strip(' _'))
 
 def get_supabase_url():
     # 1. secrets.toml 확인
@@ -45,9 +55,13 @@ def migrate():
     s_conn = sqlite3.connect(DB_FILE)
     s_cur = s_conn.cursor()
     s_cur.execute("SELECT regulation_name, reg_date, unique_key, ref_no, article_title, content FROM regulation_history ORDER BY id")
-    rows = s_cur.fetchall()
+    raw_rows = s_cur.fetchall()
     s_conn.close()
-    print(f"   └─ 총 {len(rows):,}건 읽기 완료 ({time.time() - t0:.2f}초)")
+    rows = [
+        (normalize_regulation_name(r[0]), r[1], r[2], r[3], r[4], r[5])
+        for r in raw_rows
+    ]
+    print(f"   └─ 총 {len(rows):,}건 읽기 및 정규화 완료 ({time.time() - t0:.2f}초)")
 
     print("\n2. Supabase PostgreSQL 연결 및 테이블 검증 중...")
     pg_conn = psycopg2.connect(url)
@@ -74,13 +88,19 @@ def migrate():
     pg_cur.execute(ddl)
     pg_conn.commit()
 
+    if "--truncate" in sys.argv or "-t" in sys.argv:
+        print("   └─ 기존 regulation_history 테이블 TRUNCATE 실행 중...")
+        pg_cur.execute("TRUNCATE TABLE regulation_history RESTART IDENTITY;")
+        pg_conn.commit()
+
     print("3. Supabase로 데이터 일괄 업로드(Batch Insert) 시작...")
     t1 = time.time()
     insert_sql = """
     INSERT INTO regulation_history 
     (regulation_name, reg_date, unique_key, ref_no, article_title, content)
     VALUES %s
-    ON CONFLICT (regulation_name, reg_date, unique_key) DO NOTHING
+    ON CONFLICT (regulation_name, reg_date, unique_key) DO UPDATE
+    SET ref_no = EXCLUDED.ref_no, article_title = EXCLUDED.article_title, content = EXCLUDED.content
     """
     batch_size = 5000
     total = len(rows)

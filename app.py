@@ -145,6 +145,12 @@ def parse_moks(base_ref: str, article_id: str, title: str, hang: str, ho: str, h
         })
     return rows
 
+def format_ho_ref(ho_num: str) -> str:
+    if "의" in ho_num:
+        main, sub = ho_num.split("의", 1)
+        return f"제{main}호의{sub}"
+    return f"제{ho_num}호"
+
 def parse_h_block(article_id: str, title: str, h_char: str, block_raw: str):
     rows = []
     ho_matches = list(HO_PATTERN.finditer(block_raw))
@@ -180,7 +186,7 @@ def parse_h_block(article_id: str, title: str, h_char: str, block_raw: str):
         if mok_matches: ho_main = remainder[: mok_matches[0].start(0)].strip()
         else: ho_main = remainder.strip()
 
-        base_ref = f"{article_id}제{h_char}항제{ho_num}호"
+        base_ref = f"{article_id}제{h_char}항{format_ho_ref(ho_num)}"
         rows.append({
             "참조번호": base_ref, "조": article_id, "조명": title,
             "항": h_char, "호": ho_num, "목": "0", "내용": ho_main
@@ -235,7 +241,7 @@ def parse_article_no_hang(article_id: str, title: str, body_text: str):
         if mok_matches: ho_main = remainder[: mok_matches[0].start(0)].strip()
         else: ho_main = remainder.strip()
 
-        base_ref = f"{article_id}제{ho_num}호"
+        base_ref = f"{article_id}{format_ho_ref(ho_num)}"
         rows.append({
             "참조번호": base_ref, "조": article_id, "조명": title,
             "항": "0", "호": ho_num, "목": "0", "내용": ho_main
@@ -463,15 +469,82 @@ def _insert_history_batch(cursor, batch_data):
             INSERT INTO regulation_history 
             (regulation_name, reg_date, unique_key, ref_no, article_title, content) 
             VALUES %s
-            ON CONFLICT (regulation_name, reg_date, unique_key) DO NOTHING
+            ON CONFLICT (regulation_name, reg_date, unique_key) DO UPDATE
+            SET ref_no = EXCLUDED.ref_no, article_title = EXCLUDED.article_title, content = EXCLUDED.content
         '''
         execute_values(cursor, query, batch_data, page_size=len(batch_data))
     else:
         cursor.executemany('''
-            INSERT OR IGNORE INTO regulation_history 
+            INSERT INTO regulation_history 
             (regulation_name, reg_date, unique_key, ref_no, article_title, content) 
             VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (regulation_name, reg_date, unique_key) DO UPDATE
+            SET ref_no = excluded.ref_no, article_title = excluded.article_title, content = excluded.content
         ''', batch_data)
+
+def normalize_regulation_name(name: str) -> str:
+    """규정명 정규화:
+    - Mac(NFD)과 Windows(NFC) 유니코드 정규화
+    - '_전문', ' 전문', '_전문_' 등 전문 식별 태그 제거
+    - '개정문', '일부개정' 등 부가 태그 제거
+    - 앞뒤 언더스코어 및 공백 정리
+    """
+    if not name:
+        return ""
+    name = unicodedata.normalize('NFC', name)
+    # 단어 내부의 '전문' (예: '전문직원 관리규정')을 훼손하지 않고
+    # 구분자(_ 또는 공백)로 둘러싸이거나 접미사로 붙은 '전문' 태그 제거
+    s = re.sub(r'[_ ]*전문(?=(_|\s|$))', '', name)
+    s = re.sub(r'[_ ]*(개정문|일부개정)(?=(_|\s|$))', '', s)
+    return unicodedata.normalize('NFC', s.strip(' _'))
+
+def clean_legacy_regulation_names(conn=None):
+    """DB 내 기존에 존재하는 '_전문' 등 불필요한 접미사가 붙은 규정명을 정리하고 중복 시 병합"""
+    should_close = False
+    if conn is None:
+        conn = get_connection()
+        should_close = True
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT DISTINCT regulation_name FROM regulation_history")
+        names = [r[0] for r in cursor.fetchall()]
+        for old_name in names:
+            new_name = normalize_regulation_name(old_name)
+            if new_name != old_name:
+                # 동일 (new_name, reg_date, unique_key) 충돌 방지용 중복 정리 후 업데이트
+                if is_postgres():
+                    cursor.execute("""
+                        DELETE FROM regulation_history target
+                        USING regulation_history src
+                        WHERE src.regulation_name = %s
+                          AND target.regulation_name = %s
+                          AND target.reg_date = src.reg_date
+                          AND target.unique_key = src.unique_key;
+                    """, (old_name, new_name))
+                    cursor.execute("""
+                        UPDATE regulation_history
+                        SET regulation_name = %s
+                        WHERE regulation_name = %s;
+                    """, (new_name, old_name))
+                else:
+                    cursor.execute("""
+                        DELETE FROM regulation_history
+                        WHERE regulation_name = ?
+                          AND reg_date || '_' || unique_key IN (
+                              SELECT reg_date || '_' || unique_key FROM regulation_history WHERE regulation_name = ?
+                          );
+                    """, (new_name, old_name))
+                    cursor.execute("""
+                        UPDATE regulation_history
+                        SET regulation_name = ?
+                        WHERE regulation_name = ?;
+                    """, (new_name, old_name))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    finally:
+        if should_close:
+            conn.close()
 
 def init_db():
     conn = get_connection()
@@ -512,27 +585,53 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_name_date ON regulation_history(regulation_name, reg_date);"
     ]
     for idx_sql in indexes: cursor.execute(idx_sql)
+    clean_legacy_regulation_names(conn)
     conn.commit()
     conn.close()
 
-@st.cache_data(ttl=3600) 
+@st.cache_resource
+def ensure_db_initialized():
+    """앱 기동 시 DB 초기화 및 레거시 데이터 자동 정규화 1회 보장"""
+    init_db()
+    return True
+
+def get_db_stats():
+    """실시간 DB 통계 조회 (총 규정 수, 총 레코드 수)"""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(DISTINCT regulation_name), COUNT(*) FROM regulation_history")
+        row = cursor.fetchone()
+        if row:
+            return {"reg_count": row[0] or 0, "row_count": row[1] or 0}
+        return {"reg_count": 0, "row_count": 0}
+    except Exception:
+        return {"reg_count": 0, "row_count": 0}
+    finally:
+        conn.close()
+
 def get_regulation_names():
-    if not is_postgres() and not os.path.exists(DB_FILE): return []
+    """DB 실데이터 기준 고유 규정명 목록 실시간 조회 (캐시 미사용으로 항상 최신 DB 반영)"""
     conn = get_connection()
     try:
         df = pd.read_sql("SELECT DISTINCT regulation_name FROM regulation_history ORDER BY regulation_name", conn)
         return df['regulation_name'].tolist()
-    except: return []
-    finally: conn.close()
+    except Exception:
+        return []
+    finally:
+        conn.close()
 
-@st.cache_data(ttl=3600)
 def get_regulation_dates(reg_name):
+    """DB 실데이터 기준 특정 규정의 개정일자 목록 실시간 조회"""
     conn = get_connection()
     try:
         q = sql_ph("SELECT DISTINCT reg_date FROM regulation_history WHERE regulation_name=? ORDER BY reg_date DESC")
         dates = pd.read_sql(q, conn, params=(reg_name,))
         return dates['reg_date'].tolist()
-    finally: conn.close()
+    except Exception:
+        return []
+    finally:
+        conn.close()
 
 def parse_filename_info(filename):
     base_name = os.path.basename(filename)
@@ -544,12 +643,12 @@ def parse_filename_info(filename):
     date_match = re.search(r'(\d{8})', name_without_ext)
     reg_date = date_match.group(1) if date_match else None
     
-    if '_전문_' in name_without_ext:
-        reg_name = name_without_ext.split('_전문_')[0]
-    elif reg_date:
-        reg_name = name_without_ext.replace(reg_date, '').strip('_')
-    else:
-        reg_name = name_without_ext
+    s = name_without_ext
+    if reg_date:
+        s = re.sub(r'_?' + reg_date + r'(\.csv|\.txt|\.hwp)?$', '', s)
+        s = s.replace(f'_{reg_date}', '').replace(reg_date, '')
+    
+    reg_name = normalize_regulation_name(s)
     return reg_name, reg_date
 
 def generate_key(row):
@@ -762,21 +861,34 @@ def process_uploaded_hwp(uploaded_file):
 # =========================================================
 st.set_page_config(page_title="금융 규정 검색 시스템", layout="wide", page_icon="⚡")
 
+# 앱 구동 시 DB 연결 및 스키마 검증/레거시 데이터 정규화 1회 자동 실행
+ensure_db_initialized()
+db_stats = get_db_stats()
+
 with st.sidebar:
+    st.subheader("🗄️ 데이터베이스 연결 현황")
+    if is_postgres():
+        st.success("🟢 **온라인 DB (Supabase PostgreSQL)**")
+    else:
+        st.info("📁 **로컬 DB (SQLite)**")
+    st.caption(f"📊 실데이터: **{db_stats['reg_count']}개 규정** / **{db_stats['row_count']:,}건 조항**")
+    st.caption("※ 모든 규정 목록과 검색은 DB 실데이터를 직접 조회합니다.")
+    st.markdown("---")
+
     # =====================================================
-    # 관리 메뉴 (접기 가능) — 접어두면 아래 '기능 선택'이 잘 보입니다.
+    # 참고 자료 관리 메뉴 (접기 가능) — 원본 파일 보관 및 수동 적재
     # =====================================================
-    with st.expander("⚙️ 관리 메뉴 (HWP 업로드 · DB 등록 · 내보내기)", expanded=False):
+    with st.expander("📁 참고 자료 관리 (원본 파일 보관 · DB 적재)", expanded=False):
+        st.caption("ℹ️ '규정' 폴더의 파일들은 원본 참고 자료 및 백업용입니다. 시스템의 모든 검색과 목록은 위 DB 실데이터를 기준으로 실시간 동작합니다.")
 
         # --- HWP 업로드 → 자동 DB 등록 (원스톱) ---
-        st.markdown("**(0) HWP 업로드 → 자동 DB 등록**")
+        st.markdown("**(1) 신규 HWP 업로드 → DB 자동 등록**")
 
-        # (참고) st.expander 는 중첩할 수 없으므로 체크박스로 가이드라인을 토글합니다.
         if st.checkbox("📋 파일명 가이드라인 보기 (필독)"):
             st.markdown(
                 f"""
-                업로드 시 파일명에서 **규정명**과 **개정일자**를 자동으로 추출합니다.
-                아래 형식을 지켜주세요.
+                업로드 시 파일명에서 **규정명**과 **개정일자**를 자동으로 추출하여 DB에 적재합니다.
+                (파일명에 `_전문_`이 포함되어 있어도 DB에는 순수 규정명으로 정규화되어 저장됩니다.)
 
                 **권장 형식**
                 ```
@@ -829,9 +941,8 @@ with st.sidebar:
         st.markdown("---")
 
         # --- 원본 파일 처리 (HWP -> TXT -> CSV) ---
-        st.markdown("**(1) 원본 파일 처리 (수동/일괄)**")
+        st.markdown("**(2) 원본 참고 파일 변환 (수동/일괄)**")
 
-        # [추가됨] HWP -> TXT 변환 버튼
         if st.button("📄 HWP -> TXT 변환"):
             if not HAS_PYHWP:
                 st.error("pyhwp 라이브러리가 설치되어 있지 않습니다. 터미널에서 'pip install pyhwp'를 실행해주세요.")
@@ -855,18 +966,18 @@ with st.sidebar:
                 else:
                     st.success(f"TXT->CSV 변환 완료! (신규: {conv}개, 건너뜀: {skip}개, 오류: {err}개)")
 
-        st.markdown("**(2) 시스템 DB 등록**")
-        if st.button("🔄 DB 업데이트 (증분)"):
-            with st.spinner(f"'{DATA_DIR}' 폴더 스캔 중..."):
+        st.markdown("**(3) 참고 파일 ➜ DB 동기화 (증분)**")
+        if st.button("🔄 참고 파일 DB 동기화"):
+            with st.spinner(f"'{DATA_DIR}' 폴더 내 CSV 파일 스캔 및 DB 적재 중..."):
                 cnt, skip = load_files()
 
             if cnt == -1:
                 st.warning(f"폴더가 생성되었습니다. CSV 파일을 '{DATA_DIR}'에 넣어주세요.")
             else:
-                st.success(f"DB 업데이트 완료! (신규: {cnt}개, 건너뜀: {skip}개)")
+                st.success(f"DB 동기화 완료! (신규: {cnt}개, 건너뜀: {skip}개)")
 
         st.write("")
-        st.markdown("**(3) 데이터 내보내기**")
+        st.markdown("**(4) 데이터 내보내기**")
         if st.button("📥 DB 전체 엑셀 다운로드 준비"):
             with st.spinner("엑셀 파일 생성 중... (데이터 양에 따라 시간이 걸릴 수 있습니다)"):
                 if is_postgres() or os.path.exists(DB_FILE):
@@ -881,11 +992,7 @@ with st.sidebar:
                     else:
                         st.error("오류 발생")
 
-        st.markdown("---")
-        if is_postgres():
-            st.caption("🟢 **DB 연결**: Supabase (PostgreSQL)")
-        else:
-            st.caption("📁 **DB 연결**: 로컬 SQLite (오프라인)")
+    st.markdown("---")
 
     # =====================================================
     # 기능 선택 (항상 노출 — 사용자가 바로 접근)
@@ -905,17 +1012,52 @@ if PREFERRED_REG_NAME in reg_names:
 # =========================================================
 
 if menu == MENU_NAMES["1"]:
-    st.subheader("📂 시스템에 등록된 규정 목록")
-    if reg_names: st.table(pd.DataFrame(reg_names, columns=["규정명"]))
-    else: st.info("데이터가 없습니다.")
+    st.subheader("📂 시스템 DB 등록 규정 목록 (실시간 실데이터)")
+    st.caption("※ 본 목록은 '규정' 폴더의 파일 목록이 아닌, **실제 데이터베이스(DB)에 적재된 실데이터**를 집계하여 실시간으로 표시합니다.")
+    conn = get_connection()
+    try:
+        q = """
+            SELECT 
+                regulation_name AS "규정명",
+                COUNT(DISTINCT reg_date) AS "개정본 수",
+                MAX(reg_date) AS "최신 개정일자",
+                COUNT(*) AS "총 조항(레코드) 수"
+            FROM regulation_history
+            GROUP BY regulation_name
+            ORDER BY regulation_name
+        """
+        df_summary = pd.read_sql(q, conn)
+        if not df_summary.empty:
+            st.dataframe(df_summary, width='stretch', hide_index=True)
+            st.caption(f"📊 총 {len(df_summary)}개 규정 / {df_summary['총 조항(레코드) 수'].sum():,}건 조항 등록됨")
+        else:
+            st.info("데이터베이스에 등록된 규정 데이터가 없습니다. 사이드바의 '참고 자료 관리'에서 HWP/CSV를 DB에 등록해주세요.")
+    finally:
+        conn.close()
 
 elif menu == MENU_NAMES["2"]:
-    st.subheader("📅 규정별 개정 히스토리")
+    st.subheader("📅 규정별 개정 히스토리 (실시간 실데이터)")
+    st.caption("※ 선택한 규정의 **실제 DB 적재 개정본** 목록 및 각 개정본별 조항 수를 실시간 표시합니다.")
     if reg_names:
         target = st.selectbox("규정 선택", reg_names, index=default_reg_index)
-        dates = get_regulation_dates(target)
-        st.write(f"**{target}** 개정일 목록:")
-        st.table(pd.DataFrame(dates, columns=["개정일자"]))
+        conn = get_connection()
+        try:
+            q = sql_ph("""
+                SELECT 
+                    reg_date AS "개정일자",
+                    COUNT(*) AS "등록 조항 수"
+                FROM regulation_history 
+                WHERE regulation_name=? 
+                GROUP BY reg_date 
+                ORDER BY reg_date DESC
+            """)
+            df_dates = pd.read_sql(q, conn, params=(target,))
+            st.write(f"**{target}** 개정일 목록 (DB 실데이터 기준 총 {len(df_dates)}개 개정본):")
+            st.dataframe(df_dates, width='stretch', hide_index=True)
+        finally:
+            conn.close()
+    else:
+        st.info("데이터가 없습니다.")
 
 elif menu == MENU_NAMES["3"]:
     st.subheader("📖 규정 전문 조회")
@@ -931,6 +1073,8 @@ elif menu == MENU_NAMES["3"]:
             df = pd.read_sql(q, conn, params=(target, date))
             conn.close()
             st.dataframe(df, width='stretch', height=600)
+    else:
+        st.info("데이터베이스에 등록된 규정 데이터가 없습니다.")
 
 elif menu == MENU_NAMES["4"]:
     st.subheader("🕰️ 조항 변경 이력 추적")
@@ -959,6 +1103,8 @@ elif menu == MENU_NAMES["4"]:
                             else: st.caption(row['content'])
                             st.divider()
                             prev = row['content']
+    else:
+        st.info("데이터베이스에 등록된 규정 데이터가 없습니다.")
 
 elif menu == MENU_NAMES["5"]:
     st.subheader("🔎 특정 시점 조항 상세 조회")
@@ -979,6 +1125,8 @@ elif menu == MENU_NAMES["5"]:
             df = pd.read_sql(q, conn, params=(target, date, f"%{ref}%"))
             conn.close()
             st.table(df)
+    else:
+        st.info("데이터베이스에 등록된 규정 데이터가 없습니다.")
 
 elif menu == MENU_NAMES["6"]:
     st.subheader("🔍 통합 키워드 검색")
@@ -1024,6 +1172,8 @@ elif menu == MENU_NAMES["6"]:
                         st.markdown(row['content'].replace(keyword, f":red[**{keyword}**]"))
         elif btn and not keyword:
             st.warning("검색어를 입력해주세요.")
+    else:
+        st.info("데이터베이스에 등록된 규정 데이터가 없습니다.")
 
 elif menu == MENU_NAMES["7"]:
     st.subheader("🔗 조항 인용 및 역참조 분석")
@@ -1131,3 +1281,5 @@ elif menu == MENU_NAMES["7"]:
                         st.markdown(row['content'].replace(term_external, f":green[**{term_external}**]"))
             else:
                 st.caption("결과 없음")
+    else:
+        st.info("데이터베이스에 등록된 규정 데이터가 없습니다.")

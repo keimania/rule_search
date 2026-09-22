@@ -58,6 +58,13 @@ def clean_text(s: str) -> str:
     return s.strip()
 
 
+def format_ho_ref(ho_num: str) -> str:
+    if "의" in ho_num:
+        main, sub = ho_num.split("의", 1)
+        return f"제{main}호의{sub}"
+    return f"제{ho_num}호"
+
+
 def parse_moks(base_ref: str, article_id: str, title: str, hang: str, ho: str, ho_text: str):
     rows = []
     mok_matches = list(MOK_PATTERN.finditer(ho_text))
@@ -115,7 +122,7 @@ def parse_h_block(article_id: str, title: str, h_char: str, block_raw: str):
         else:
             ho_main = remainder.strip()
 
-        base_ref = f"{article_id}제{h_char}항제{ho_num}호"
+        base_ref = f"{article_id}제{h_char}항{format_ho_ref(ho_num)}"
         rows.append({
             "참조번호": base_ref, "조": article_id, "조명": title,
             "항": h_char, "호": ho_num, "목": "0", "내용": ho_main
@@ -175,7 +182,7 @@ def parse_article_no_hang(article_id: str, title: str, body_text: str):
         else:
             ho_main = remainder.strip()
 
-        base_ref = f"{article_id}제{ho_num}호"
+        base_ref = f"{article_id}{format_ho_ref(ho_num)}"
         rows.append({
             "참조번호": base_ref, "조": article_id, "조명": title,
             "항": "0", "호": ho_num, "목": "0", "내용": ho_main
