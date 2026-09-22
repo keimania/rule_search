@@ -612,12 +612,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-@st.cache_resource
-def ensure_db_initialized():
-    """앱 기동 시 DB 초기화 및 레거시 데이터 자동 정규화 1회 보장"""
-    init_db()
-    return True
-
 def get_db_stats():
     """실시간 DB 통계 조회 (총 규정 수, 총 레코드 수)"""
     conn = get_connection()
@@ -677,6 +671,23 @@ def parse_filename_info(filename):
 def generate_key(row):
     return f"{row['장번호']}_{row['조']}_{row['항']}_{row['호']}_{row['목']}"
 
+def build_unique_keys(df: pd.DataFrame) -> list:
+    """단일 규정 데이터프레임 내 고유키 생성 및 중복 키 고유화 (부칙 등 동일 조항 번호 반복 대응)"""
+    for col in ['장번호', '조', '항', '호', '목']:
+        if col not in df.columns:
+            df[col] = "0"
+    key_counts = {}
+    unique_keys = []
+    for _, row in df.iterrows():
+        base_key = generate_key(row)
+        if base_key in key_counts:
+            key_counts[base_key] += 1
+            unique_keys.append(f"{base_key}_{key_counts[base_key]}")
+        else:
+            key_counts[base_key] = 0
+            unique_keys.append(base_key)
+    return unique_keys
+
 def load_files():
     init_db()
     if not os.path.exists(DATA_DIR):
@@ -707,7 +718,7 @@ def load_files():
 
         try:
             df = pd.read_csv(filepath)
-            df['unique_key'] = df.apply(generate_key, axis=1)
+            df['unique_key'] = build_unique_keys(df)
             
             for _, row in df.iterrows():
                 batch_data.append((
@@ -821,13 +832,8 @@ def load_single_csv(filepath: str, overwrite: bool = False, original_filename: s
             conn.close()
             return {"status": "error", "message": "파싱 결과가 0건입니다. 원본 파일 형식을 확인해주세요."}
 
-        # 조, 항, 호, 목 누락 컬럼 기본값 보정
-        for col in ['장번호', '조', '항', '호', '목']:
-            if col not in df.columns:
-                df[col] = "0"
-
-        if 'unique_key' not in df.columns:
-            df['unique_key'] = df.apply(generate_key, axis=1)
+        # 조, 항, 호, 목 누락 컬럼 기본값 보정 및 고유키 중복 해소
+        df['unique_key'] = build_unique_keys(df)
 
         batch = [
             (reg_name, reg_date, row['unique_key'],
@@ -948,13 +954,147 @@ def get_recent_uploads(limit: int = 10):
         conn.close()
 
 
+def delete_regulation_revision(reg_name: str, reg_date: str, delete_local_files: bool = False):
+    """DB에서 특정 규정의 특정 개정일자 데이터를 삭제.
+    선택 시 '규정' 폴더의 로컬 참고 파일(.hwp, .txt, .csv)도 함께 삭제.
+    반환: {'deleted_rows': int, 'deleted_files': list, 'status': 'success'|'error', 'message': str}
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        # 1. 삭제 대상 레코드 수 확인
+        cursor.execute(
+            sql_ph("SELECT COUNT(*) FROM regulation_history WHERE regulation_name=? AND reg_date=?"),
+            (reg_name, reg_date)
+        )
+        row = cursor.fetchone()
+        count = row[0] if row else 0
+        if count == 0:
+            conn.close()
+            return {"status": "error", "message": "해당 규정 및 일자의 데이터가 DB에 존재하지 않습니다."}
+
+        # 2. DB 레코드 삭제
+        cursor.execute(
+            sql_ph("DELETE FROM regulation_history WHERE regulation_name=? AND reg_date=?"),
+            (reg_name, reg_date)
+        )
+        # 업로드 이력에서도 삭제
+        try:
+            cursor.execute(
+                sql_ph("DELETE FROM regulation_uploads WHERE regulation_name=? AND reg_date=?"),
+                (reg_name, reg_date)
+            )
+        except Exception:
+            pass
+
+        conn.commit()
+
+        # 3. 로컬 파일 삭제 옵션 처리
+        deleted_files = []
+        if delete_local_files and os.path.exists(DATA_DIR):
+            for ext in ['.hwp', '.txt', '.csv']:
+                pattern = os.path.join(DATA_DIR, f"*{reg_name}*{reg_date}*{ext}")
+                for f in glob.glob(pattern):
+                    try:
+                        os.remove(f)
+                        deleted_files.append(os.path.basename(f))
+                    except Exception:
+                        pass
+
+        return {
+            "status": "success",
+            "deleted_rows": count,
+            "deleted_files": deleted_files,
+            "reg_name": reg_name,
+            "reg_date": reg_date
+        }
+    except Exception as e:
+        conn.rollback()
+        return {"status": "error", "message": str(e)}
+    finally:
+        conn.close()
+
+
+def auto_sync_missing_hwps():
+    """'규정' 폴더의 .hwp 파일 중 DB에 누락된 규정을 감지하여 자동으로 변환 및 DB 적재.
+    앱 시작 시 1회 실행되어 항상 최신 DB 데이터를 보장합니다.
+    """
+    if not os.path.exists(DATA_DIR):
+        return 0, 0, []
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    existing_pairs = set()
+    try:
+        cursor.execute("SELECT DISTINCT regulation_name, reg_date FROM regulation_history")
+        for row in cursor.fetchall():
+            existing_pairs.add((row[0], row[1]))
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+    hwp_files = glob.glob(os.path.join(DATA_DIR, "*.hwp"))
+    if not hwp_files:
+        return 0, 0, []
+
+    inserted_count = 0
+    error_count = 0
+    synced_items = []
+
+    for hwp_path_str in hwp_files:
+        reg_name, reg_date = parse_filename_info(hwp_path_str)
+        if not reg_date:
+            continue
+        if (reg_name, reg_date) in existing_pairs:
+            continue
+
+        # DB에 없음 -> 자동 파싱 및 DB 적재 파이프라인 가동
+        hwp_path = Path(hwp_path_str)
+        txt_path, err = convert_single_hwp_to_txt(hwp_path)
+        if err:
+            error_count += 1
+            continue
+
+        try:
+            text = read_source_text(str(txt_path))
+            df = parse_all(text)
+            csv_path = txt_path.with_suffix(".csv")
+            df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+            res = load_single_csv(
+                str(csv_path),
+                overwrite=False,
+                original_filename=hwp_path.name,
+                file_size=hwp_path.stat().st_size
+            )
+            if res.get("status") in ("inserted", "updated"):
+                inserted_count += 1
+                synced_items.append((reg_name, reg_date, res.get("rows", 0)))
+                existing_pairs.add((reg_name, reg_date))
+            else:
+                error_count += 1
+        except Exception:
+            error_count += 1
+
+    return inserted_count, error_count, synced_items
+
+
+@st.cache_resource
+def ensure_db_initialized():
+    """앱 기동 시 DB 초기화, 레거시 데이터 정규화, 누락된 HWP 파일 자동 동기화 1회 보장"""
+    init_db()
+    ins, err, items = auto_sync_missing_hwps()
+    return {"inserted": ins, "errors": err, "items": items}
+
+
 # =========================================================
 # 4. 메인 UI 구성
 # =========================================================
 st.set_page_config(page_title="금융 규정 검색 시스템", layout="wide", page_icon="⚡")
 
-# 앱 구동 시 DB 연결 및 스키마 검증/레거시 데이터 정규화 1회 자동 실행
-ensure_db_initialized()
+# 앱 구동 시 DB 연결 및 스키마 검증/레거시 데이터 정규화 및 누락 HWP 자동 동기화 1회 자동 실행
+sync_result = ensure_db_initialized()
 db_stats = get_db_stats()
 
 with st.sidebar:
@@ -1050,8 +1190,26 @@ with st.sidebar:
 
         st.markdown("---")
 
+        # --- 규정 폴더 HWP 자동 검사 및 DB 적재 ---
+        st.markdown("**(2) 규정 폴더 HWP 자동 검사 및 DB 적재**")
+        st.caption("새로운 HWP 파일이 '규정' 폴더에 추가된 경우, DB 미등록 여부를 확인하여 자동으로 파싱 및 적재합니다.")
+        if st.button("🔄 미등록 HWP 검사 및 자동 적재"):
+            with st.spinner("규정 폴더 내 HWP 파일을 스캔하여 미등록 규정을 동기화 중입니다..."):
+                ins, err, items = auto_sync_missing_hwps()
+                if ins > 0:
+                    st.success(f"✅ 총 {ins}건의 규정 개정본이 DB에 자동 등록되었습니다!")
+                    for item in items:
+                        st.write(f"- **{item[0]}** ({item[1]}): {item[2]:,}건 조항")
+                    st.rerun()
+                elif err > 0:
+                    st.error(f"동기화 중 오류가 {err}건 발생했습니다.")
+                else:
+                    st.info("ℹ️ 모든 HWP 파일이 이미 DB에 등록되어 있습니다. (동기화 불필요)")
+
+        st.markdown("---")
+
         # --- 원본 파일 처리 (HWP -> TXT -> CSV) ---
-        st.markdown("**(2) 원본 참고 파일 변환 (수동/일괄)**")
+        st.markdown("**(3) 개별 수동 도구 (단계별 변환)**")
 
         if st.button("📄 HWP -> TXT 변환"):
             if not HAS_PYHWP:
@@ -1076,8 +1234,7 @@ with st.sidebar:
                 else:
                     st.success(f"TXT->CSV 변환 완료! (신규: {conv}개, 건너뜀: {skip}개, 오류: {err}개)")
 
-        st.markdown("**(3) 참고 파일 ➜ DB 동기화 (증분)**")
-        if st.button("🔄 참고 파일 DB 동기화"):
+        if st.button("📄 CSV 파일 ➜ DB 수동 적재"):
             with st.spinner(f"'{DATA_DIR}' 폴더 내 CSV 파일 스캔 및 DB 적재 중..."):
                 cnt, skip = load_files()
 
@@ -1087,7 +1244,65 @@ with st.sidebar:
                 st.success(f"DB 동기화 완료! (신규: {cnt}개, 건너뜀: {skip}개)")
 
         st.write("")
-        st.markdown("**(4) 데이터 내보내기**")
+        st.markdown("---")
+
+        # --- DB 특정 일자 규정 삭제 ---
+        st.markdown("**(4) DB 특정 개정본 삭제 관리**")
+        st.caption("선택한 규정의 특정 개정일자 데이터를 DB에서 안전하게 삭제합니다. 삭제 후 필요 시 HWP 업로드나 자동 동기화로 다시 적재할 수 있습니다.")
+
+        reg_names_for_del = get_regulation_names()
+        if reg_names_for_del:
+            del_reg_name = st.selectbox("삭제 대상 규정 선택", reg_names_for_del, key="del_reg_select")
+            del_dates = get_regulation_dates(del_reg_name)
+            if del_dates:
+                del_reg_date = st.selectbox("삭제 대상 개정일자 선택", del_dates, key="del_date_select")
+
+                # 대상 조항 수 표시
+                target_count = 0
+                _conn = get_connection()
+                try:
+                    _cur = _conn.cursor()
+                    _cur.execute(sql_ph("SELECT COUNT(*) FROM regulation_history WHERE regulation_name=? AND reg_date=?"), (del_reg_name, del_reg_date))
+                    _r = _cur.fetchone()
+                    if _r: target_count = _r[0]
+                except Exception:
+                    pass
+                finally:
+                    _conn.close()
+
+                st.warning(f"선택 항목: **[{del_reg_name}] {del_reg_date}** (총 {target_count:,}건 조항)")
+
+                del_files_opt = st.checkbox(
+                    "규정 폴더 내의 로컬 참고 파일(.hwp, .txt, .csv)도 함께 삭제",
+                    value=False,
+                    key="del_files_checkbox",
+                    help="체크를 해제하면 DB에서만 삭제되므로, 추후 '미등록 HWP 자동 적재' 버튼이나 파일 업로드를 통해 다시 적재할 수 있습니다."
+                )
+
+                del_confirm = st.checkbox(
+                    f"⚠️ 위 [{del_reg_name}] ({del_reg_date}) 데이터를 DB에서 삭제하는 것에 동의합니다.",
+                    key="del_confirm_checkbox"
+                )
+
+                if st.button("🗑️ 선택한 개정본 DB에서 삭제", type="secondary", disabled=not del_confirm):
+                    with st.spinner("DB에서 삭제 중입니다..."):
+                        del_res = delete_regulation_revision(del_reg_name, del_reg_date, delete_local_files=del_files_opt)
+                    if del_res.get("status") == "success":
+                        msg = f"✅ [{del_res['reg_name']}] {del_res['reg_date']} 데이터 {del_res['deleted_rows']:,}건이 DB에서 정상 삭제되었습니다."
+                        if del_res['deleted_files']:
+                            msg += f" (로컬 파일 {len(del_res['deleted_files'])}개 삭제됨)"
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(f"삭제 실패: {del_res.get('message', '알 수 없는 오류')}")
+            else:
+                st.info("해당 규정에 등록된 개정일자가 없습니다.")
+        else:
+            st.info("DB에 등록된 규정이 없습니다.")
+
+        st.write("")
+        st.markdown("---")
+        st.markdown("**(5) 데이터 백업 및 내보내기**")
         if st.button("📥 DB 전체 엑셀 다운로드 준비"):
             with st.spinner("엑셀 파일 생성 중... (데이터 양에 따라 시간이 걸릴 수 있습니다)"):
                 if is_postgres() or os.path.exists(DB_FILE):
