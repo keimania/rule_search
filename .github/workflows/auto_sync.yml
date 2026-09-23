@@ -1,0 +1,52 @@
+name: Auto Sync Regulations (HWP -> TXT -> CSV -> DB)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '규정/**.hwp'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run regulation sync pipeline
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          python scripts/sync_regulations.py
+
+      - name: Commit and push generated files
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add 규정/*.txt 규정/*.csv regulation_master.db
+          if git diff --staged --quiet; then
+            echo "No generated files changed. Nothing to commit."
+          else
+            git commit -m "🤖 [Auto Sync] Generate TXT/CSV & sync DB from HWP updates [skip ci]"
+            git push
+          fi
