@@ -195,6 +195,141 @@ def is_external_prefixed(content: str, start: int, is_rule: bool) -> bool:
 
     return False
 
+def parse_clause_citations(text: str):
+    """
+    본문 텍스트 내에서 모든 조항 언급과 이를 지배하는 규정/법령 접두어를 순서대로 추출.
+    - 연속 열거(예: '규정 제6조제2항, 제25조 및 ...') 시 선행 접두어 지배 상속
+    - 새로운 법규명 접두어 등장 시 전환
+    - 문장 종결 또는 서술어 등장 시 단절
+    반환값: list of dict(
+        'clause': 정규화된 조항 문자열 (예: '제6조제2항', '제25조'),
+        'raw': 원문 조항 표기,
+        'span': (start, end),
+        'gov_prefix': 지배 접두어 문자열 (예: '규정', '이 세칙', '「유가증권시장 업무규정」', None)
+    )
+    """
+    if not text:
+        return []
+
+    # 조항 패턴:
+    # 1. 완결형 조항: 제X조, 제X조제Y항, 제X조제Y항제Z호, 제X조제Y항제Z호가목 등
+    # 2. 독립형 항/호: 제①항, 제1항 등 (앞 조항과 나열될 때)
+    art_pattern = re.compile(
+        r'(제\s*\d+(?:의\s*\d+)?\s*조(?:\s*제?\s*[①-⑳\d]+\s*항)?(?:\s*제?\s*\d+\s*호)?(?:\s*[가-하]\s*목)?|'
+        r'제\s*[①-⑳\d]+\s*항(?:\s*제?\s*\d+\s*호)?(?:\s*[가-하]\s*목)?)'
+    )
+
+    # 접두어 패턴 (법규명 또는 지시어+법규명):
+    prefix_pattern = re.compile(
+        r'(?:「[^」]+」|『[^』]+』|"[^"]+"|'
+        r'(?:(?<=[^\w가-힣])|^)(?:이|동|당해|해당|본)?\s*(?:시행세칙|세칙|규정|규칙|법률|법|시행령|영))'
+    )
+
+    # 연속 열거 연결자 패턴: 쉼표(,), 및, ·, ~, 내지, 부터, 또는, 공백
+    continuation_pattern = re.compile(r'^[\s,·~및또는내지부터]+$')
+
+    matches = list(art_pattern.finditer(text))
+    citations = []
+
+    for i, m in enumerate(matches):
+        start, end = m.span()
+        clause_str = m.group(1).replace(" ", "")
+
+        prev_end = matches[i - 1].end() if i > 0 else 0
+        between = text[prev_end:start]
+
+        p_matches = list(prefix_pattern.finditer(between))
+        gov_prefix = None
+
+        if p_matches:
+            last_p = p_matches[-1]
+            p_text = last_p.group().strip()
+            after_p = between[last_p.end():]
+
+            # after_p에 단절 요인이 있는지 검사
+            if not re.search(r'[\.\n;]|\b(?:을|를|은|는|이|가|에서|에게|위반|경우|인하여)\b|에\s*따라|에\s*의하', after_p):
+                gov_prefix = p_text
+
+        if gov_prefix is None:
+            # between에 새로운 접두어가 없다면, 앞선 조항의 지배 접두어를 상속받는지 확인
+            clean_between = between.strip()
+            if clean_between and continuation_pattern.match(clean_between) and i > 0 and citations:
+                gov_prefix = citations[-1]['gov_prefix']
+            else:
+                gov_prefix = None
+
+        citations.append({
+            'clause': clause_str,
+            'raw': m.group(1),
+            'span': (start, end),
+            'gov_prefix': gov_prefix
+        })
+
+    return citations
+
+def match_article(clause_str: str, target_variants: list) -> bool:
+    """
+    본문에서 추출된 조항 표기(clause_str)가 검색 대상 조항 변형(target_variants)에 부합하는지 판별.
+    - 예: target='제25조'일 때: '제25조', '제25조제1항', '제25조제①항' 모두 매칭 (단 '제25조의2'는 제외)
+    - 예: target='제25조제1항'일 때: '제25조제1항', '제25조제①항' 매칭
+    """
+    norm_clause = normalize_art_input(clause_str)
+    clause_hang_variants = get_hang_variants(norm_clause) or [norm_clause]
+
+    for tv in target_variants:
+        norm_tv = normalize_art_input(tv)
+        if any(v == norm_tv for v in clause_hang_variants):
+            return True
+
+        if re.match(r'^제\d+조$', norm_tv):
+            if re.match(rf'^{norm_tv}(?:제?[①-⑳\d]+항)?(?:제?\d+호)?(?:[가-하]목)?$', norm_clause):
+                return True
+
+    return False
+
+def classify_reference(curr_reg: str, target_reg: str, partner_reg_name: str, gov_prefix: str):
+    """
+    인용 조항의 지배 접두어(gov_prefix)와 현재 규정(curr_reg), 대상 규정(target_reg)을 기반으로
+    내부 참조('internal'), 파트너 참조('partner'), 타 규정 참조('external'), 또는 'ignore' 반환.
+    """
+    is_curr_rule = "시행세칙" in curr_reg or "세칙" in curr_reg or "규칙" in curr_reg
+    is_target_rule = "시행세칙" in target_reg or "세칙" in target_reg or "규칙" in target_reg
+
+    # 1. 내부 참조: curr_reg == target_reg
+    if curr_reg == target_reg:
+        if gov_prefix is None:
+            return "internal"
+        p_clean = gov_prefix.replace("「", "").replace("」", "").replace("“", "").replace("”", "").replace('"', '').strip()
+        if p_clean in [target_reg, f"이 {p_clean.split()[-1]}", f"본 {p_clean.split()[-1]}", f"동 {p_clean.split()[-1]}",
+                       "이 규정", "본 규정", "동 규정", "이 세칙", "본 세칙", "동 세칙", "이 규칙", "본 규칙"]:
+            return "internal"
+        return "ignore"
+
+    # 2. 파트너 규정 참조: partner_reg_name in curr_reg
+    elif partner_reg_name in curr_reg:
+        if gov_prefix is None:
+            return "ignore"
+        p_clean = gov_prefix.replace("「", "").replace("」", "").replace("“", "").replace("”", "").replace('"', '').strip()
+        
+        if not is_target_rule and is_curr_rule:
+            short_target = target_reg.split()[-1]
+            if p_clean in ["규정", short_target, target_reg, f"이 {short_target}", f"당해 {short_target}"]:
+                return "partner"
+        elif is_target_rule and not is_curr_rule:
+            short_target = target_reg.split()[-1]
+            if p_clean in ["세칙", "시행세칙", short_target, target_reg]:
+                return "partner"
+        return "ignore"
+
+    # 3. 타 규정 참조: 제3의 규정
+    else:
+        if gov_prefix is None:
+            return "ignore"
+        p_clean = gov_prefix.replace("「", "").replace("」", "").replace("“", "").replace("”", "").replace('"', '').strip()
+        if p_clean == target_reg or (len(target_reg) >= 4 and target_reg in p_clean):
+            return "external"
+        return "ignore"
+
 def find_valid_internal_matches(content: str, terms: list, is_rule: bool):
     """
     content 내에서 terms(조항 표현 목록)가 등장하는 위치들 중,
@@ -1963,28 +2098,34 @@ def get_target_article_content(target_reg: str, target_art: str, latest_only: bo
 
 @st.cache_data(ttl=600)
 def get_menu7_reference_analysis(target_reg, target_art, latest_only):
-    """메뉴 7: 조항 인용 및 역참조 분석 - 캐시 적용 (원문자/숫자 항 상호 호환)"""
+    """메뉴 7: 조항 인용 및 역참조 분석 - 캐시 적용 (연속 조항 열거 및 지배 접두어 문맥 분석)"""
     conn = get_connection()
     try:
         clean_art, partner_reg_name, terms_internal, terms_partner, terms_external = get_citation_terms(target_reg, target_art)
+        variants = get_hang_variants(clean_art) or [clean_art]
         
         prefix_tbl = "h." if latest_only else ""
-        int_cond = " OR ".join([f"{prefix_tbl}content LIKE ?" for _ in terms_internal])
-        partner_cond = " OR ".join([f"{prefix_tbl}content LIKE ?" for _ in terms_partner])
-        ext_cond = " OR ".join([f"{prefix_tbl}content LIKE ?" for _ in terms_external])
+        art_cond = " OR ".join([f"{prefix_tbl}content LIKE ?" for _ in variants])
+        
+        short_name = target_reg.split()[-1]
+        ext_likes = [f"%{target_reg}%", f"%「{target_reg}」%"]
+        if len(short_name) >= 3 and short_name != target_reg:
+            ext_likes.append(f"%{short_name}%")
+        ext_cond = " OR ".join([f"{prefix_tbl}content LIKE ?" for _ in ext_likes])
         
         partner_like = f"%{partner_reg_name}%"
-        params = (
-            [target_reg] + [f"%{t}%" for t in terms_internal] +
-            [partner_like] + [f"%{t}%" for t in terms_partner] +
-            [f"%{t}%" for t in terms_external]
-        )
         
         where_clause = f"""
-            ({prefix_tbl}regulation_name = ? AND ({int_cond})) OR 
-            ({prefix_tbl}regulation_name LIKE ? AND ({partner_cond})) OR
-            ({ext_cond})
+            ({prefix_tbl}regulation_name = ? AND ({art_cond})) OR 
+            ({prefix_tbl}regulation_name LIKE ? AND ({art_cond})) OR
+            (({art_cond}) AND ({ext_cond}))
         """
+        
+        params = (
+            [target_reg] + [f"%{v}%" for v in variants] +
+            [partner_like] + [f"%{v}%" for v in variants] +
+            [f"%{v}%" for v in variants] + ext_likes
+        )
         
         if latest_only:
             full_query = f"""
@@ -2008,7 +2149,7 @@ def get_menu7_reference_analysis(target_reg, target_art, latest_only):
             """
 
         df_res = pd.read_sql(sql_ph(full_query), conn, params=params)
-        return df_res, partner_reg_name, terms_internal, terms_partner, terms_external
+        return df_res, partner_reg_name, clean_art, variants
     finally:
         conn.close()
 
@@ -2162,23 +2303,32 @@ elif menu == MENU_NAMES["7"]:
             
             # 2. 이어서 이를 참조하는 내역(기존 인용 분석 결과) 표시
             st.markdown(f"### 🔗 [{clean_art}] 인용 및 역참조 분석 결과")
-            df_filtered, partner_reg_name, terms_internal, terms_partner, terms_external = get_menu7_reference_analysis(target_reg, clean_art, latest_only)
+            df_filtered, partner_reg_name, target_art_clean, variants = get_menu7_reference_analysis(target_reg, clean_art, latest_only)
             
             results_internal, results_partner, results_external = [], [], []
-            is_rule = "시행세칙" in target_reg or "세칙" in target_reg or "규칙" in target_reg
             
             for _, row in df_filtered.iterrows():
                 curr_reg = row['regulation_name']
                 content = row['content']
+                citations = parse_clause_citations(content)
                 
-                if curr_reg == target_reg:
-                    spans = find_valid_internal_matches(content, terms_internal, is_rule)
-                    if spans:
-                        results_internal.append((row, spans))
-                elif partner_reg_name in curr_reg: 
-                    if any(t in content for t in terms_partner): results_partner.append(row)
-                else:
-                    if any(t in content for t in terms_external): results_external.append(row)
+                int_spans, part_spans, ext_spans = [], [], []
+                for c in citations:
+                    if match_article(c['clause'], variants):
+                        cat = classify_reference(curr_reg, target_reg, partner_reg_name, c['gov_prefix'])
+                        if cat == "internal":
+                            int_spans.append(c['span'])
+                        elif cat == "partner":
+                            part_spans.append(c['span'])
+                        elif cat == "external":
+                            ext_spans.append(c['span'])
+                
+                if int_spans:
+                    results_internal.append((row, int_spans))
+                if part_spans:
+                    results_partner.append((row, part_spans))
+                if ext_spans:
+                    results_external.append((row, ext_spans))
 
             st.success(f"분석 완료: 내부 {len(results_internal)}건 / {partner_reg_name} {len(results_partner)}건 / 타 규정 {len(results_external)}건")
             
@@ -2192,22 +2342,21 @@ elif menu == MENU_NAMES["7"]:
                 st.caption("결과 없음")
 
             st.markdown(f"### 🤝 [{partner_reg_name}] 참조")
-            st.info(f"검색 조건: {', '.join([repr(t) for t in terms_partner[:4]])}")
+            st.caption(f"※ 연속 조항 열거(예: '규정 제6조, 제25조') 및 하위 항·호 인용까지 지배 접두어 문맥을 자동 반영하여 분석합니다.")
             if results_partner:
-                for row in results_partner:
+                for row, spans in results_partner:
                     with st.container(border=True):
                         st.markdown(f"**📌 {row['ref_no']} {row['article_title']}** :grey[[시행일자: {row['reg_date']}]]")
-                        st.markdown(highlight_terms(row['content'], terms_partner, "blue"))
+                        st.markdown(highlight_spans(row['content'], spans, "blue"))
             else:
                 st.caption("결과 없음")
 
             st.markdown(f"### 🌏 타 규정 참조")
-            st.info(f"검색 조건: {', '.join([repr(t) for t in terms_external[:4]])}")
             if results_external:
-                for row in results_external:
+                for row, spans in results_external:
                     with st.container(border=True):
                         st.markdown(f"**📌 [{row['regulation_name']}] {row['ref_no']} {row['article_title']}** :grey[[시행일자: {row['reg_date']}]]")
-                        st.markdown(highlight_terms(row['content'], terms_external, "green"))
+                        st.markdown(highlight_spans(row['content'], spans, "green"))
             else:
                 st.caption("결과 없음")
     else:
