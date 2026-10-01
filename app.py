@@ -159,6 +159,79 @@ def highlight_terms(text: str, terms: list, color: str = "red") -> str:
     pattern = re.compile("(" + "|".join(re.escape(t) for t in sorted_terms) + ")")
     return pattern.sub(rf":{color}[**\1**]", text)
 
+def is_external_prefixed(content: str, start: int, is_rule: bool) -> bool:
+    """
+    content 내 start 위치에서 시작하는 조항 표현(term)이
+    내부 조항이 아닌 외부 법규/상위 규정(또는 하위 세칙)에 종속된 인용인지 판별.
+    """
+    chunk = content[max(0, start - 150):start]
+    # 문장 또는 절 구분 기호(. \n ;) 기준 마지막 절 확인
+    parts = re.split(r'[\.\n;]', chunk)
+    before = parts[-1]
+    
+    if is_rule:
+        # 대상이 '시행세칙'인 경우:
+        # 상위 '규정', 법, 영, 시행령, 규칙 등 외부 규정이 앞에 붙은 경우 제외
+        # 1. 직전 단어 확인 (예: '규정 ', '규정', '업무규정 ', '「유가증권시장 업무규정」 ', '법 ', '영 ')
+        if re.search(r'(?:이\s*|동\s*|당해\s*|해당\s*)?[가-힣]*(?:규정|법|영|시행령|규칙)(?:」|』|\"|\')?\s*$', before):
+            return True
+        # 2. 나열형 확인: '규정 제20조, 제21조제1항 및 ' 등 규정 하위 나열
+        m = re.search(r'(?:이\s*|동\s*|당해\s*|해당\s*)?[가-힣]*(?:규정|법|영|시행령|규칙)(?:」|』|\"|\')?\s+(.+)$', before)
+        if m:
+            between = m.group(1)
+            if re.match(r'^(?:제\s*[\d①-⑳가-힣호목조항의\s]+(?:,|및|·|부터|~|\s+및\s+)\s*)+$', between):
+                return True
+    else:
+        # 대상이 '규정'(상위)인 경우:
+        # '세칙', '시행세칙', '규칙' 또는 법, 영 등 타 법령이 앞에 붙은 경우 제외
+        # (주의: '이 규정 제X조'는 자기 자신(내부) 참조이므로 제외 대상이 아님)
+        if re.search(r'(?:이\s*|동\s*|당해\s*|해당\s*)?[가-힣]*(?:시행세칙|세칙|규칙|법|영|시행령)(?:」|』|\"|\')?\s*$', before):
+            return True
+        m = re.search(r'(?:이\s*|동\s*|당해\s*|해당\s*)?[가-힣]*(?:시행세칙|세칙|규칙|법|영|시행령)(?:」|』|\"|\')?\s+(.+)$', before)
+        if m:
+            between = m.group(1)
+            if re.match(r'^(?:제\s*[\d①-⑳가-힣호목조항의\s]+(?:,|및|·|부터|~|\s+및\s+)\s*)+$', between):
+                return True
+
+    return False
+
+def find_valid_internal_matches(content: str, terms: list, is_rule: bool):
+    """
+    content 내에서 terms(조항 표현 목록)가 등장하는 위치들 중,
+    상위 '규정' 등의 외부 접두어가 붙지 않은 '순수 내부 참조' 위치[(start, end), ...]를 반환.
+    """
+    if not content or not terms:
+        return []
+    sorted_terms = sorted(set(terms), key=len, reverse=True)
+    pattern = re.compile("(" + "|".join(re.escape(t) for t in sorted_terms) + ")")
+    valid_spans = []
+    for m in pattern.finditer(content):
+        start, end = m.span()
+        if not is_external_prefixed(content, start, is_rule):
+            valid_spans.append((start, end))
+    return valid_spans
+
+def highlight_spans(text: str, spans: list, color: str = "red") -> str:
+    """주어진 인덱스 구간(spans)들만 지정 색상 마크다운으로 하이라이트"""
+    if not text or not spans:
+        return text or ""
+    # 중복 구간 병합
+    sorted_spans = sorted(set(spans), key=lambda x: (x[0], -x[1]))
+    merged = []
+    for s, e in sorted_spans:
+        if not merged:
+            merged.append([s, e])
+        else:
+            prev = merged[-1]
+            if s <= prev[1]:
+                prev[1] = max(prev[1], e)
+            else:
+                merged.append([s, e])
+    res = text
+    for start, end in reversed(merged):
+        res = res[:start] + f":{color}[**{res[start:end]}**]" + res[end:]
+    return res
+
 
 # =========================================================
 # 2. HWP -> TXT 및 TXT -> CSV 변환 관련 함수
@@ -2092,13 +2165,16 @@ elif menu == MENU_NAMES["7"]:
             df_filtered, partner_reg_name, terms_internal, terms_partner, terms_external = get_menu7_reference_analysis(target_reg, clean_art, latest_only)
             
             results_internal, results_partner, results_external = [], [], []
+            is_rule = "시행세칙" in target_reg or "세칙" in target_reg or "규칙" in target_reg
             
             for _, row in df_filtered.iterrows():
                 curr_reg = row['regulation_name']
                 content = row['content']
                 
                 if curr_reg == target_reg:
-                    if any(t in content for t in terms_internal): results_internal.append(row)
+                    spans = find_valid_internal_matches(content, terms_internal, is_rule)
+                    if spans:
+                        results_internal.append((row, spans))
                 elif partner_reg_name in curr_reg: 
                     if any(t in content for t in terms_partner): results_partner.append(row)
                 else:
@@ -2108,10 +2184,10 @@ elif menu == MENU_NAMES["7"]:
             
             st.markdown(f"### 🏠 [{target_reg}] 내부 참조")
             if results_internal:
-                for row in results_internal:
+                for row, spans in results_internal:
                     with st.container(border=True):
                         st.markdown(f"**📌 {row['ref_no']} {row['article_title']}** :grey[[시행일자: {row['reg_date']}]]")
-                        st.markdown(highlight_terms(row['content'], terms_internal, "red"))
+                        st.markdown(highlight_spans(row['content'], spans, "red"))
             else:
                 st.caption("결과 없음")
 
