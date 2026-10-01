@@ -48,6 +48,117 @@ MOK_PATTERN = re.compile(r"(^|\n)\s*([가-하])\.\s*", re.MULTILINE)
 CHAPTER_PATTERN = re.compile(r"^제(\d+)장\s*(.+)")
 SECTION_PATTERN = re.compile(r"^제(\d+)절\s*(.+)")
 
+# ----------------------------------------------------------------------
+# [추가됨] 원문자(①~⑳) ↔ 아라비아 숫자(1~20) '항' 상호 호환 유틸리티
+# ----------------------------------------------------------------------
+CIRCLED_TO_ARABIC = {chr(9311 + i): str(i) for i in range(1, 21)}
+ARABIC_TO_CIRCLED = {str(i): chr(9311 + i) for i in range(1, 21)}
+
+def to_circled_hang(s: str) -> str:
+    """아라비아 숫자 항(제1항, 1항 등)을 원문자 항(제①항, ①항 등)으로 변환"""
+    def _repl(m):
+        prefix = m.group(1) or ""
+        num = m.group(2)
+        suffix = m.group(3) or ""
+        if num in ARABIC_TO_CIRCLED:
+            return f"{prefix}{ARABIC_TO_CIRCLED[num]}{suffix}"
+        return m.group(0)
+    return re.sub(r"(제\s*)?(\d{1,2})(\s*항)", _repl, s)
+
+def to_arabic_hang(s: str) -> str:
+    """원문자 항(제①항, ①항 등)을 아라비아 숫자 항(제1항, 1항 등)으로 변환"""
+    def _repl(m):
+        prefix = m.group(1) or ""
+        char = m.group(2)
+        suffix = m.group(3) or ""
+        return f"{prefix}{CIRCLED_TO_ARABIC.get(char, char)}{suffix}"
+    return re.sub(r"(제\s*)?([①-⑳])(\s*항)?", _repl, s)
+
+def normalize_art_input(text: str) -> str:
+    """조항 번호 입력 정규화 (예: '20조' -> '제20조')"""
+    s = text.strip() if text else ""
+    if re.match(r"^\d+조", s):
+        s = f"제{s}"
+    return s
+
+def get_hang_variants(text: str) -> list:
+    """입력된 조항/키워드에 대해 원문자(①)/숫자(1), 띄어쓰기 유무 등 가능한 모든 동등 표현 생성"""
+    if not text:
+        return []
+    s = normalize_art_input(text)
+    raw_list = [s]
+    ar = to_arabic_hang(s)
+    ci = to_circled_hang(s)
+    raw_list.extend([ar, ci])
+    
+    expanded = []
+    for item in raw_list:
+        expanded.append(item)
+        nospace = re.sub(r"\s+", "", item)
+        expanded.append(nospace)
+        m = re.search(r"(제\d+조(?:의\d+)?)(제?[①-⑳\d]+항.*)", nospace)
+        if m:
+            expanded.append(f"{m.group(1)} {m.group(2)}")
+            
+    for item in list(expanded):
+        if re.match(r"^제([①-⑳\d]+항)$", item):
+            expanded.append(re.sub(r"^제", "", item))
+        elif re.match(r"^([①-⑳\d]+항)$", item):
+            expanded.append(f"제{item}")
+            
+    seen = set()
+    result = []
+    for item in expanded:
+        clean = item.strip()
+        if clean and clean not in seen:
+            seen.add(clean)
+            result.append(clean)
+    return result
+
+def get_citation_terms(target_reg: str, target_art: str):
+    """관심 규정 및 조항에 대한 내부/파트너/타 규정 인용 검색어(동등 표현 포함) 생성"""
+    clean_art = normalize_art_input(target_art)
+    variants = get_hang_variants(clean_art)
+    if not variants:
+        variants = [clean_art]
+        
+    is_rule = "시행세칙" in target_reg
+    partner_reg_name = target_reg.replace(" 시행세칙", "").replace("시행세칙", "").strip() if is_rule else f"{target_reg} 시행세칙"
+    
+    terms_internal = list(variants)
+    
+    terms_partner = []
+    prefix_p = "세칙" if is_rule else "규정"
+    for v in variants:
+        terms_partner.extend([f"{prefix_p} {v}", f"{prefix_p}{v}"])
+        
+    terms_external = []
+    for v in variants:
+        terms_external.extend([
+            f"「{target_reg}」 {v}",
+            f"「{target_reg}」{v}",
+            f"{target_reg} {v}",
+            f"{target_reg}{v}",
+        ])
+    short_name = target_reg.split()[-1]
+    if len(short_name) >= 3 and short_name != target_reg:
+        for v in variants:
+            terms_external.extend([f"{short_name} {v}", f"{short_name}{v}"])
+            
+    def _dedup(l):
+        seen = set()
+        return [x for x in l if not (x in seen or seen.add(x))]
+        
+    return clean_art, partner_reg_name, _dedup(terms_internal), _dedup(terms_partner), _dedup(terms_external)
+
+def highlight_terms(text: str, terms: list, color: str = "red") -> str:
+    """텍스트 내 일치하는 검색어들을 지정 색상 마크다운으로 하이라이트 (긴 구문 우선 매칭)"""
+    if not text or not terms:
+        return text or ""
+    sorted_terms = sorted(set(terms), key=len, reverse=True)
+    pattern = re.compile("(" + "|".join(re.escape(t) for t in sorted_terms) + ")")
+    return pattern.sub(rf":{color}[**\1**]", text)
+
 
 # =========================================================
 # 2. HWP -> TXT 및 TXT -> CSV 변환 관련 함수
@@ -1661,35 +1772,55 @@ def get_menu3_full_text(target_reg, date):
 
 @st.cache_data(ttl=600)
 def get_menu4_history(target, ref):
-    """메뉴 4: 조항 변경 이력 추적 - 캐시 적용"""
+    """메뉴 4: 조항 변경 이력 추적 - 캐시 적용 (원문자/숫자 항 상호 호환)"""
     conn = get_connection()
     try:
-        q = sql_ph("SELECT reg_date, ref_no, article_title, content, unique_key FROM regulation_history WHERE regulation_name=? AND ref_no LIKE ? ORDER BY unique_key, reg_date")
-        return pd.read_sql(q, conn, params=(target, f"%{ref}%"))
+        variants = get_hang_variants(ref)
+        if not variants:
+            variants = [ref]
+        conds = " OR ".join(["ref_no LIKE ?" for _ in variants])
+        q = f"SELECT reg_date, ref_no, article_title, content, unique_key FROM regulation_history WHERE regulation_name=? AND ({conds}) ORDER BY unique_key, reg_date"
+        params = [target] + [f"%{v}%" for v in variants]
+        return pd.read_sql(sql_ph(q), conn, params=params)
     finally:
         conn.close()
 
 @st.cache_data(ttl=600)
 def get_menu5_detail(target, date, ref):
-    """메뉴 5: 특정 시점 조항 상세 조회 - 캐시 적용"""
+    """메뉴 5: 특정 시점 조항 상세 조회 - 캐시 적용 (원문자/숫자 항 상호 호환)"""
     conn = get_connection()
     try:
-        q = sql_ph("""
+        variants = get_hang_variants(ref)
+        if not variants:
+            variants = [ref]
+        conds = " OR ".join(["ref_no LIKE ?" for _ in variants])
+        q = f"""
             SELECT ref_no AS "조항", article_title AS "조명", content AS "내용" 
             FROM regulation_history 
-            WHERE regulation_name=? AND reg_date=? AND ref_no LIKE ?
-        """)
-        return pd.read_sql(q, conn, params=(target, date, f"%{ref}%"))
+            WHERE regulation_name=? AND reg_date=? AND ({conds})
+            ORDER BY id
+        """
+        params = [target, date] + [f"%{v}%" for v in variants]
+        return pd.read_sql(sql_ph(q), conn, params=params)
     finally:
         conn.close()
 
 @st.cache_data(ttl=600)
 def get_menu6_keyword_search(target, keyword, latest):
-    """메뉴 6: 통합 키워드 검색 - 캐시 적용"""
+    """메뉴 6: 통합 키워드 검색 - 캐시 적용 (원문자/숫자 항 및 조항 번호 상호 호환)"""
     conn = get_connection()
     try:
-        q = "SELECT regulation_name, reg_date, ref_no, article_title, content FROM regulation_history WHERE (content LIKE ? OR article_title LIKE ?)"
-        p = [f"%{keyword}%", f"%{keyword}%"]
+        variants = get_hang_variants(keyword)
+        if not variants:
+            variants = [keyword]
+        sub_conds = []
+        p = []
+        for v in variants:
+            sub_conds.append("(content LIKE ? OR article_title LIKE ? OR ref_no LIKE ?)")
+            p.extend([f"%{v}%", f"%{v}%", f"%{v}%"])
+            
+        cond_str = " OR ".join(sub_conds)
+        q = f"SELECT regulation_name, reg_date, ref_no, article_title, content FROM regulation_history WHERE ({cond_str})"
         if target != "전체 규정 (All)":
             q += " AND regulation_name = ?"
             p.append(target)
@@ -1709,20 +1840,25 @@ def get_menu6_keyword_search(target, keyword, latest):
 
 @st.cache_data(ttl=600)
 def get_target_article_content(target_reg: str, target_art: str, latest_only: bool = True):
-    """메뉴 7: 관심 조항 번호에 따른 원문 내용 조회 (최신일자 기준 원문 추출)"""
+    """메뉴 7: 관심 조항 번호에 따른 원문 내용 조회 (원문자/숫자 항 상호 호환)"""
     conn = get_connection()
     try:
-        clean_art = target_art.strip()
-        if not clean_art.startswith("제") and re.match(r"^\d+", clean_art):
-            clean_art = f"제{clean_art}"
+        clean_art = normalize_art_input(target_art)
+        variants = get_hang_variants(clean_art)
+        if not variants:
+            variants = [clean_art]
             
-        # 조항 검색 패턴: '제20조' 입력 시 '제20조의2'가 섞이지 않도록 경계 조건 적용
-        if "의" in clean_art or "항" in clean_art or "호" in clean_art:
-            art_condition = "(ref_no = ? OR ref_no LIKE ? OR ref_no LIKE ?)"
-            params_art = [clean_art, f"{clean_art}%", f"{clean_art}(%"]
-        else:
-            art_condition = "(ref_no = ? OR ref_no LIKE ? OR ref_no LIKE ?)"
-            params_art = [clean_art, f"{clean_art}제%", f"{clean_art}(%"]
+        conds = []
+        params_art = []
+        for v in variants:
+            if "의" in v or "항" in v or "호" in v:
+                conds.append("(ref_no = ? OR ref_no LIKE ? OR ref_no LIKE ?)")
+                params_art.extend([v, f"{v}%", f"{v}(%"])
+            else:
+                conds.append("(ref_no = ? OR ref_no LIKE ? OR ref_no LIKE ?)")
+                params_art.extend([v, f"{v}제%", f"{v}(%"])
+                
+        art_condition = "(" + " OR ".join(conds) + ")"
 
         if latest_only:
             query = f"""
@@ -1754,30 +1890,28 @@ def get_target_article_content(target_reg: str, target_art: str, latest_only: bo
 
 @st.cache_data(ttl=600)
 def get_menu7_reference_analysis(target_reg, target_art, latest_only):
-    """메뉴 7: 조항 인용 및 역참조 분석 - 캐시 적용"""
+    """메뉴 7: 조항 인용 및 역참조 분석 - 캐시 적용 (원문자/숫자 항 상호 호환)"""
     conn = get_connection()
     try:
-        is_rule = "시행세칙" in target_reg
-        partner_reg_name = target_reg.replace(" 시행세칙", "").replace("시행세칙", "").strip() if is_rule else f"{target_reg} 시행세칙"
-
-        term_internal = target_art 
-        term_partner = f"세칙 {target_art}" if is_rule else f"규정 {target_art}"
-        term_external = f"「{target_reg}」 {target_art}"
-
-        base_query = """
-            SELECT regulation_name, reg_date, ref_no, article_title, content
-            FROM regulation_history
-            WHERE 
-               (regulation_name = ? AND content LIKE ?) OR 
-               (regulation_name LIKE ? AND content LIKE ?) OR
-               (content LIKE ?)
-        """
+        clean_art, partner_reg_name, terms_internal, terms_partner, terms_external = get_citation_terms(target_reg, target_art)
+        
+        prefix_tbl = "h." if latest_only else ""
+        int_cond = " OR ".join([f"{prefix_tbl}content LIKE ?" for _ in terms_internal])
+        partner_cond = " OR ".join([f"{prefix_tbl}content LIKE ?" for _ in terms_partner])
+        ext_cond = " OR ".join([f"{prefix_tbl}content LIKE ?" for _ in terms_external])
+        
         partner_like = f"%{partner_reg_name}%"
-        params = [
-            target_reg, f"%{term_internal}%",
-            partner_like, f"%{term_partner}%",
-            f"%{term_external}%"
-        ]
+        params = (
+            [target_reg] + [f"%{t}%" for t in terms_internal] +
+            [partner_like] + [f"%{t}%" for t in terms_partner] +
+            [f"%{t}%" for t in terms_external]
+        )
+        
+        where_clause = f"""
+            ({prefix_tbl}regulation_name = ? AND ({int_cond})) OR 
+            ({prefix_tbl}regulation_name LIKE ? AND ({partner_cond})) OR
+            ({ext_cond})
+        """
         
         if latest_only:
             full_query = f"""
@@ -1789,17 +1923,19 @@ def get_menu7_reference_analysis(target_reg, target_art, latest_only):
                 SELECT h.regulation_name, h.reg_date, h.ref_no, h.article_title, h.content
                 FROM regulation_history h
                 JOIN LatestDates ld ON h.regulation_name = ld.regulation_name AND h.reg_date = ld.max_date
-                WHERE 
-                   (h.regulation_name = ? AND h.content LIKE ?) OR 
-                   (h.regulation_name LIKE ? AND h.content LIKE ?) OR
-                   (h.content LIKE ?)
+                WHERE {where_clause}
                 ORDER BY h.regulation_name, h.id
             """
         else:
-            full_query = base_query + " ORDER BY regulation_name, id"
+            full_query = f"""
+                SELECT regulation_name, reg_date, ref_no, article_title, content
+                FROM regulation_history
+                WHERE {where_clause}
+                ORDER BY regulation_name, id
+            """
 
         df_res = pd.read_sql(sql_ph(full_query), conn, params=params)
-        return df_res, partner_reg_name, term_internal, term_partner, term_external
+        return df_res, partner_reg_name, terms_internal, terms_partner, terms_external
     finally:
         conn.close()
 
@@ -1903,10 +2039,11 @@ elif menu == MENU_NAMES["6"]:
                 st.success(f"총 {len(df)}건 검색됨")
                 if len(df) > 200: st.warning("⚠️ 결과가 너무 많아 일부만 표시될 수 있습니다.")
                     
+                kw_variants = get_hang_variants(keyword)
                 for _, row in df.iterrows():
                     with st.container(border=True):
                         st.markdown(f"**📌 [{row['regulation_name']}] {row['ref_no']} {row['article_title']}** :grey[{row['reg_date']}]")
-                        st.markdown(row['content'].replace(keyword, f":red[**{keyword}**]"))
+                        st.markdown(highlight_terms(row['content'], kw_variants, "red"))
         elif btn and not keyword:
             st.warning("검색어를 입력해주세요.")
     else:
@@ -1952,7 +2089,7 @@ elif menu == MENU_NAMES["7"]:
             
             # 2. 이어서 이를 참조하는 내역(기존 인용 분석 결과) 표시
             st.markdown(f"### 🔗 [{clean_art}] 인용 및 역참조 분석 결과")
-            df_filtered, partner_reg_name, term_internal, term_partner, term_external = get_menu7_reference_analysis(target_reg, clean_art, latest_only)
+            df_filtered, partner_reg_name, terms_internal, terms_partner, terms_external = get_menu7_reference_analysis(target_reg, clean_art, latest_only)
             
             results_internal, results_partner, results_external = [], [], []
             
@@ -1961,11 +2098,11 @@ elif menu == MENU_NAMES["7"]:
                 content = row['content']
                 
                 if curr_reg == target_reg:
-                    if term_internal in content: results_internal.append(row)
+                    if any(t in content for t in terms_internal): results_internal.append(row)
                 elif partner_reg_name in curr_reg: 
-                    if term_partner in content: results_partner.append(row)
+                    if any(t in content for t in terms_partner): results_partner.append(row)
                 else:
-                    if term_external in content: results_external.append(row)
+                    if any(t in content for t in terms_external): results_external.append(row)
 
             st.success(f"분석 완료: 내부 {len(results_internal)}건 / {partner_reg_name} {len(results_partner)}건 / 타 규정 {len(results_external)}건")
             
@@ -1974,27 +2111,27 @@ elif menu == MENU_NAMES["7"]:
                 for row in results_internal:
                     with st.container(border=True):
                         st.markdown(f"**📌 {row['ref_no']} {row['article_title']}** :grey[[시행일자: {row['reg_date']}]]")
-                        st.markdown(row['content'].replace(term_internal, f":red[**{term_internal}**]"))
+                        st.markdown(highlight_terms(row['content'], terms_internal, "red"))
             else:
                 st.caption("결과 없음")
 
             st.markdown(f"### 🤝 [{partner_reg_name}] 참조")
-            st.info(f"검색 조건: '{term_partner}'")
+            st.info(f"검색 조건: {', '.join([repr(t) for t in terms_partner[:4]])}")
             if results_partner:
                 for row in results_partner:
                     with st.container(border=True):
                         st.markdown(f"**📌 {row['ref_no']} {row['article_title']}** :grey[[시행일자: {row['reg_date']}]]")
-                        st.markdown(row['content'].replace(term_partner, f":blue[**{term_partner}**]"))
+                        st.markdown(highlight_terms(row['content'], terms_partner, "blue"))
             else:
                 st.caption("결과 없음")
 
             st.markdown(f"### 🌏 타 규정 참조")
-            st.info(f"검색 조건: '{term_external}'")
+            st.info(f"검색 조건: {', '.join([repr(t) for t in terms_external[:4]])}")
             if results_external:
                 for row in results_external:
                     with st.container(border=True):
                         st.markdown(f"**📌 [{row['regulation_name']}] {row['ref_no']} {row['article_title']}** :grey[[시행일자: {row['reg_date']}]]")
-                        st.markdown(row['content'].replace(term_external, f":green[**{term_external}**]"))
+                        st.markdown(highlight_terms(row['content'], terms_external, "green"))
             else:
                 st.caption("결과 없음")
     else:
