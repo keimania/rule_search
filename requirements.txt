@@ -3,4 +3,5 @@ pandas
 openpyxl
 pyhwp
 psycopg2-binary
+psycopg[binary]
 sqlalchemy

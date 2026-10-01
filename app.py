@@ -527,19 +527,27 @@ def get_candidate_db_urls(raw_url: str) -> list:
 
 def get_db_url():
     """Supabase PostgreSQL 연결 URL 확인 (Streamlit secrets -> 환경 변수 -> secrets.toml)"""
-    # 1. Streamlit secrets 확인
+    # 1. Streamlit secrets 확인 (다양한 설정 키 및 섹션 지원)
     try:
-        if "SUPABASE_DB_URL" in st.secrets and st.secrets["SUPABASE_DB_URL"]:
-            return str(st.secrets["SUPABASE_DB_URL"]).strip()
+        for key in ["SUPABASE_DB_URL", "DATABASE_URL", "POSTGRES_URL"]:
+            if key in st.secrets and st.secrets[key]:
+                return str(st.secrets[key]).strip()
         if "database" in st.secrets and "url" in st.secrets["database"] and st.secrets["database"]["url"]:
             return str(st.secrets["database"]["url"]).strip()
+        if "connections" in st.secrets:
+            conns = st.secrets["connections"]
+            if "supabase" in conns and "url" in conns["supabase"] and conns["supabase"]["url"]:
+                return str(conns["supabase"]["url"]).strip()
+            if "postgresql" in conns and "url" in conns["postgresql"] and conns["postgresql"]["url"]:
+                return str(conns["postgresql"]["url"]).strip()
     except Exception:
         pass
         
     # 2. OS 환경 변수 확인
-    env_url = os.environ.get("SUPABASE_DB_URL", "").strip()
-    if env_url:
-        return env_url
+    for env_key in ["SUPABASE_DB_URL", "DATABASE_URL", "POSTGRES_URL"]:
+        env_val = os.environ.get(env_key, "").strip()
+        if env_val:
+            return env_val
         
     # 3. 로컬 .streamlit/secrets.toml 직접 탐색
     secrets_path = Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"
@@ -552,8 +560,9 @@ def get_db_url():
             except ImportError:
                 import toml
                 s_data = toml.load(str(secrets_path))
-            if "SUPABASE_DB_URL" in s_data and s_data["SUPABASE_DB_URL"]:
-                return str(s_data["SUPABASE_DB_URL"]).strip()
+            for key in ["SUPABASE_DB_URL", "DATABASE_URL", "POSTGRES_URL"]:
+                if key in s_data and s_data[key]:
+                    return str(s_data[key]).strip()
             if "database" in s_data and "url" in s_data["database"] and s_data["database"]["url"]:
                 return str(s_data["database"]["url"]).strip()
         except Exception:
@@ -561,18 +570,35 @@ def get_db_url():
             
     return ""
 
+def to_sqlalchemy_url(url: str) -> str:
+    """SQLAlchemy dialect driver 지정 (psycopg2 우선, 없으면 psycopg3)"""
+    if not url:
+        return url
+    if url.startswith("postgresql://"):
+        try:
+            import psycopg2
+            return url.replace("postgresql://", "postgresql+psycopg2://", 1)
+        except ImportError:
+            try:
+                import psycopg
+                return url.replace("postgresql://", "postgresql+psycopg://", 1)
+            except ImportError:
+                return url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    return url
+
 @st.cache_resource(show_spinner=False)
 def _connect_postgres_cached(candidate_url: str):
     """지정된 URL로 커넥션 풀을 생성하고 실제 핑(ping) 테스트를 거쳐 캐싱"""
     from sqlalchemy import create_engine, text
+    sa_url = to_sqlalchemy_url(candidate_url)
     engine = create_engine(
-        candidate_url,
+        sa_url,
         pool_size=5,
         max_overflow=10,
         pool_timeout=8,
         pool_recycle=1800,
         pool_pre_ping=True,
-        connect_args={"connect_timeout": 4}
+        connect_args={"connect_timeout": 5}
     )
     with engine.connect() as conn:
         conn.execute(text("SELECT 1;"))
@@ -1682,6 +1708,51 @@ def get_menu6_keyword_search(target, keyword, latest):
         conn.close()
 
 @st.cache_data(ttl=600)
+def get_target_article_content(target_reg: str, target_art: str, latest_only: bool = True):
+    """메뉴 7: 관심 조항 번호에 따른 원문 내용 조회 (최신일자 기준 원문 추출)"""
+    conn = get_connection()
+    try:
+        clean_art = target_art.strip()
+        if not clean_art.startswith("제") and re.match(r"^\d+", clean_art):
+            clean_art = f"제{clean_art}"
+            
+        # 조항 검색 패턴: '제20조' 입력 시 '제20조의2'가 섞이지 않도록 경계 조건 적용
+        if "의" in clean_art or "항" in clean_art or "호" in clean_art:
+            art_condition = "(ref_no = ? OR ref_no LIKE ? OR ref_no LIKE ?)"
+            params_art = [clean_art, f"{clean_art}%", f"{clean_art}(%"]
+        else:
+            art_condition = "(ref_no = ? OR ref_no LIKE ? OR ref_no LIKE ?)"
+            params_art = [clean_art, f"{clean_art}제%", f"{clean_art}(%"]
+
+        if latest_only:
+            query = f"""
+                WITH LatestDate AS (
+                    SELECT MAX(reg_date) as max_date 
+                    FROM regulation_history 
+                    WHERE regulation_name = ?
+                )
+                SELECT h.reg_date, h.ref_no, h.article_title, h.content
+                FROM regulation_history h
+                JOIN LatestDate ld ON h.regulation_name = ? AND h.reg_date = ld.max_date
+                WHERE {art_condition}
+                ORDER BY h.id
+            """
+            params = [target_reg, target_reg] + params_art
+        else:
+            query = f"""
+                SELECT reg_date, ref_no, article_title, content
+                FROM regulation_history
+                WHERE regulation_name = ? AND {art_condition}
+                ORDER BY reg_date DESC, id
+            """
+            params = [target_reg] + params_art
+
+        df = pd.read_sql(sql_ph(query), conn, params=params)
+        return clean_art, df
+    finally:
+        conn.close()
+
+@st.cache_data(ttl=600)
 def get_menu7_reference_analysis(target_reg, target_art, latest_only):
     """메뉴 7: 조항 인용 및 역참조 분석 - 캐시 적용"""
     conn = get_connection()
@@ -1857,7 +1928,31 @@ elif menu == MENU_NAMES["7"]:
             search_btn = st.form_submit_button("인용 분석 시작", type="primary")
         
         if search_btn and target_art:
-            df_filtered, partner_reg_name, term_internal, term_partner, term_external = get_menu7_reference_analysis(target_reg, target_art, latest_only)
+            # 1. 관심 조항 원문 내용 먼저 조회 및 표시
+            clean_art, df_target = get_target_article_content(target_reg, target_art, latest_only)
+            
+            st.markdown(f"### 📖 [관심 조항 원문] {target_reg} {clean_art}")
+            if not df_target.empty:
+                first_title = df_target.iloc[0]['article_title']
+                reg_date_val = df_target.iloc[0]['reg_date']
+                title_suffix = f" ({first_title})" if first_title else ""
+                
+                with st.container(border=True):
+                    st.markdown(f"#### 📌 **[{target_reg}] {clean_art}{title_suffix}** :grey[[시행일자: {reg_date_val}]]")
+                    st.markdown("---")
+                    for _, row in df_target.iterrows():
+                        sub_ref = row['ref_no']
+                        st.markdown(f"**{sub_ref}**")
+                        st.markdown(f"> {row['content']}")
+                        st.markdown("")
+            else:
+                st.warning(f"⚠️ 선택하신 규정({target_reg})에서 '{clean_art}' 조항의 원문을 찾을 수 없습니다. (조항 번호를 확인해주세요)")
+
+            st.markdown("---")
+            
+            # 2. 이어서 이를 참조하는 내역(기존 인용 분석 결과) 표시
+            st.markdown(f"### 🔗 [{clean_art}] 인용 및 역참조 분석 결과")
+            df_filtered, partner_reg_name, term_internal, term_partner, term_external = get_menu7_reference_analysis(target_reg, clean_art, latest_only)
             
             results_internal, results_partner, results_external = [], [], []
             
@@ -1878,7 +1973,7 @@ elif menu == MENU_NAMES["7"]:
             if results_internal:
                 for row in results_internal:
                     with st.container(border=True):
-                        st.markdown(f"**📌 {row['ref_no']} {row['article_title']}**")
+                        st.markdown(f"**📌 {row['ref_no']} {row['article_title']}** :grey[[시행일자: {row['reg_date']}]]")
                         st.markdown(row['content'].replace(term_internal, f":red[**{term_internal}**]"))
             else:
                 st.caption("결과 없음")
@@ -1888,7 +1983,7 @@ elif menu == MENU_NAMES["7"]:
             if results_partner:
                 for row in results_partner:
                     with st.container(border=True):
-                        st.markdown(f"**📌 {row['ref_no']} {row['article_title']}**")
+                        st.markdown(f"**📌 {row['ref_no']} {row['article_title']}** :grey[[시행일자: {row['reg_date']}]]")
                         st.markdown(row['content'].replace(term_partner, f":blue[**{term_partner}**]"))
             else:
                 st.caption("결과 없음")
@@ -1898,7 +1993,7 @@ elif menu == MENU_NAMES["7"]:
             if results_external:
                 for row in results_external:
                     with st.container(border=True):
-                        st.markdown(f"**📌 [{row['regulation_name']}] {row['ref_no']} {row['article_title']}**")
+                        st.markdown(f"**📌 [{row['regulation_name']}] {row['ref_no']} {row['article_title']}** :grey[[시행일자: {row['reg_date']}]]")
                         st.markdown(row['content'].replace(term_external, f":green[**{term_external}**]"))
             else:
                 st.caption("결과 없음")
