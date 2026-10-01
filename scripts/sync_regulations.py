@@ -16,6 +16,7 @@ import io
 import re
 import argparse
 import unicodedata
+import urllib.parse
 from pathlib import Path
 from contextlib import closing
 import pandas as pd
@@ -59,6 +60,84 @@ def get_db_url(args_url=None):
         except Exception:
             pass
     return ""
+
+
+def get_candidate_db_urls(raw_url: str) -> list:
+    """다양한 연결 형태(세션 풀러, 직접 연결, 트랜잭션 풀러 등)의 후보 URL 목록 생성"""
+    if not raw_url or not raw_url.startswith("postgresql://"):
+        return [raw_url] if raw_url else []
+    
+    prefix = "postgresql://"
+    rest = raw_url[len(prefix):]
+    if "@" not in rest:
+        return [raw_url]
+    
+    last_at = rest.rfind("@")
+    userinfo = rest[:last_at]
+    host_db = rest[last_at + 1:]
+    
+    if "/" not in host_db:
+        return [raw_url]
+    
+    host_port, dbname = host_db.split("/", 1)
+    if ":" in host_port:
+        host, port = host_port.split(":", 1)
+    else:
+        host, port = host_port, "5432"
+        
+    if ":" in userinfo:
+        user, pwd = userinfo.split(":", 1)
+        encoded_pwd = urllib.parse.quote(urllib.parse.unquote(pwd), safe="")
+    else:
+        user = userinfo
+        encoded_pwd = ""
+        
+    pwd_part = f":{encoded_pwd}" if encoded_pwd else ""
+    
+    project_ref = None
+    if "." in user:
+        project_ref = user.split(".", 1)[1]
+    elif "supabase.co" in host:
+        m = re.search(r"(?:db\.)?([a-z0-9]+)\.supabase\.co", host)
+        if m:
+            project_ref = m.group(1)
+            
+    candidates = []
+    candidates.append(f"{prefix}{user}{pwd_part}@{host_port}/{dbname}")
+    
+    if project_ref:
+        candidates.append(f"{prefix}postgres.{project_ref}{pwd_part}@aws-0-ap-northeast-1.pooler.supabase.com:5432/{dbname}")
+        candidates.append(f"{prefix}postgres.{project_ref}{pwd_part}@aws-0-ap-northeast-1.pooler.supabase.com:6543/{dbname}")
+        candidates.append(f"{prefix}postgres{pwd_part}@db.{project_ref}.supabase.co:5432/{dbname}")
+        candidates.append(f"{prefix}postgres.{project_ref}{pwd_part}@aws-0-ap-northeast-2.pooler.supabase.com:5432/{dbname}")
+        
+    seen = set()
+    result = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            result.append(c)
+    return result
+
+
+def test_supabase_connection(raw_url: str):
+    """후보 URL들을 테스트하여 실제 접속 가능한 URL 반환"""
+    import psycopg2
+    candidates = get_candidate_db_urls(raw_url)
+    last_err = ""
+    for cand in candidates:
+        try:
+            conn = psycopg2.connect(cand, connect_timeout=3)
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1;")
+            conn.close()
+            m = re.search(r"@([^/]+)", cand)
+            host_str = m.group(1) if m else "Supabase"
+            return {"success": True, "url": cand, "host": host_str, "error": None}
+        except Exception as e:
+            last_err = str(e).strip().split("\n")[0]
+    return {"success": False, "url": None, "host": None, "error": last_err or "연결 실패"}
+
 
 
 def normalize_regulation_name(name: str) -> str:
@@ -328,7 +407,7 @@ def sync_to_supabase(csv_path: str, reg_name: str, reg_date: str, db_url: str, f
     import psycopg2
     from psycopg2.extras import execute_values
     
-    conn = psycopg2.connect(db_url)
+    conn = psycopg2.connect(db_url, connect_timeout=5)
     cur = conn.cursor()
     
     cur.execute("SELECT 1 FROM regulation_history WHERE regulation_name=%s AND reg_date=%s LIMIT 1", (reg_name, reg_date))
@@ -425,11 +504,18 @@ def run_pipeline(force: bool = False, db_url_override: str = None):
 
     # 3. DB 동기화
     db_url = get_db_url(db_url_override)
+    active_pg_url = None
     csv_files = sorted(glob.glob(os.path.join(DATA_DIR, "*.csv")))
     
     print("\n🗄️ 데이터베이스 동기화 진행:")
     if db_url:
-        print("  - 온라인 Supabase PostgreSQL: 연결 설정됨 (동기화 활성화)")
+        print("  - 온라인 Supabase PostgreSQL: 연결 테스트 중...")
+        test_res = test_supabase_connection(db_url)
+        if test_res["success"]:
+            active_pg_url = test_res["url"]
+            print(f"  - 온라인 Supabase PostgreSQL: 연결 성공 ({test_res['host']})")
+        else:
+            print(f"  ⚠️ 온라인 Supabase PostgreSQL: 연결 불가 ({test_res['error']}). SQLite 동기화만 진행합니다.")
     else:
         print("  - 온라인 Supabase PostgreSQL: URL 미설정 (건너뜀)")
     print(f"  - 로컬 SQLite DB: {DB_FILE}")
@@ -452,9 +538,9 @@ def run_pipeline(force: bool = False, db_url_override: str = None):
             print(f"  [SQLite 적재] {reg_name} ({reg_date}): {rows:,}건")
 
         # Supabase 동기화
-        if db_url:
+        if active_pg_url:
             try:
-                pg_res, pg_rows = sync_to_supabase(csv_str, reg_name, reg_date, db_url, force=force)
+                pg_res, pg_rows = sync_to_supabase(csv_str, reg_name, reg_date, active_pg_url, force=force)
                 if pg_res == "inserted":
                     pg_synced += 1
                     total_pg_rows += pg_rows

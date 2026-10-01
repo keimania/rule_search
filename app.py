@@ -8,6 +8,7 @@ import io
 import sys
 from pathlib import Path
 import unicodedata
+import urllib.parse
 import warnings
 warnings.filterwarnings('ignore', message='.*pandas only supports SQLAlchemy connectable.*')
 
@@ -415,38 +416,220 @@ def convert_txt_files_to_csv():
 # =========================================================
 # 3. DB 핸들링 및 최적화 함수
 # =========================================================
+
+# 전역 DB 연결 상태 진단 객체
+DB_DIAGNOSTICS = {
+    "supabase_configured": False,
+    "supabase_connected": False,
+    "connected_url": None,
+    "connected_host": None,
+    "project_ref": None,
+    "error_message": None,
+    "candidate_results": []
+}
+
+def mask_db_url(url: str) -> str:
+    """보안을 위해 URL 내 비밀번호 마스킹"""
+    if not url:
+        return ""
+    return re.sub(r":([^@]+)@", r":****@", url)
+
+def extract_host_from_url(url: str) -> str:
+    """URL에서 호스트 및 포트 추출"""
+    if not url:
+        return ""
+    m = re.search(r"@([^/]+)", url)
+    return m.group(1) if m else "Supabase Cloud"
+
+def normalize_pg_url(url: str) -> str:
+    """PostgreSQL URL 내 비밀번호의 특수문자(%21, %40 등) 안전 인코딩 및 정규화"""
+    if not url or not url.startswith("postgresql://"):
+        return url
+    prefix = "postgresql://"
+    rest = url[len(prefix):]
+    if "@" not in rest:
+        return url
+    last_at = rest.rfind("@")
+    userinfo = rest[:last_at]
+    hostinfo = rest[last_at + 1:]
+    
+    if ":" in userinfo:
+        user, pwd = userinfo.split(":", 1)
+        decoded_pwd = urllib.parse.unquote(pwd)
+        encoded_pwd = urllib.parse.quote(decoded_pwd, safe="")
+        return f"{prefix}{user}:{encoded_pwd}@{hostinfo}"
+    return url
+
+def get_candidate_db_urls(raw_url: str) -> list:
+    """다양한 연결 형태(세션 풀러, 직접 연결, 트랜잭션 풀러 등)의 후보 URL 목록 생성"""
+    if not raw_url or not raw_url.startswith("postgresql://"):
+        return [raw_url] if raw_url else []
+    
+    prefix = "postgresql://"
+    rest = raw_url[len(prefix):]
+    if "@" not in rest:
+        return [raw_url]
+    
+    last_at = rest.rfind("@")
+    userinfo = rest[:last_at]
+    host_db = rest[last_at + 1:]
+    
+    if "/" not in host_db:
+        return [raw_url]
+    
+    host_port, dbname = host_db.split("/", 1)
+    if ":" in host_port:
+        host, port = host_port.split(":", 1)
+    else:
+        host, port = host_port, "5432"
+        
+    if ":" in userinfo:
+        user, pwd = userinfo.split(":", 1)
+        encoded_pwd = urllib.parse.quote(urllib.parse.unquote(pwd), safe="")
+    else:
+        user = userinfo
+        encoded_pwd = ""
+        
+    pwd_part = f":{encoded_pwd}" if encoded_pwd else ""
+    
+    # Supabase 프로젝트 Ref 식별
+    project_ref = None
+    if "." in user:
+        project_ref = user.split(".", 1)[1]
+    elif "supabase.co" in host:
+        m = re.search(r"(?:db\.)?([a-z0-9]+)\.supabase\.co", host)
+        if m:
+            project_ref = m.group(1)
+            
+    candidates = []
+    # 1. 정규화된 원본 URL (최우선 시도)
+    candidates.append(f"{prefix}{user}{pwd_part}@{host_port}/{dbname}")
+    
+    # 2. Supabase 프로젝트인 경우 연결 후보 다각화
+    if project_ref:
+        # 후보 A: 도쿄 세션 풀러 (Session mode, IPv4 지원, 포트 5432)
+        candidates.append(f"{prefix}postgres.{project_ref}{pwd_part}@aws-0-ap-northeast-1.pooler.supabase.com:5432/{dbname}")
+        # 후보 B: 도쿄 트랜잭션 풀러 (Transaction mode, IPv4 지원, 포트 6543)
+        candidates.append(f"{prefix}postgres.{project_ref}{pwd_part}@aws-0-ap-northeast-1.pooler.supabase.com:6543/{dbname}")
+        # 후보 C: 직접 연결 (Direct connection, 포트 5432)
+        candidates.append(f"{prefix}postgres{pwd_part}@db.{project_ref}.supabase.co:5432/{dbname}")
+        # 후보 D: 서울 세션 풀러 (서울 리전 풀러 포트 5432)
+        candidates.append(f"{prefix}postgres.{project_ref}{pwd_part}@aws-0-ap-northeast-2.pooler.supabase.com:5432/{dbname}")
+        
+    # 중복 제거 (순서 보존)
+    seen = set()
+    result = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            result.append(c)
+    return result
+
 def get_db_url():
-    """Supabase PostgreSQL 연결 URL 확인 (Streamlit secrets 또는 환경 변수)"""
+    """Supabase PostgreSQL 연결 URL 확인 (Streamlit secrets -> 환경 변수 -> secrets.toml)"""
+    # 1. Streamlit secrets 확인
     try:
-        if "SUPABASE_DB_URL" in st.secrets:
-            return st.secrets["SUPABASE_DB_URL"]
-        if "database" in st.secrets and "url" in st.secrets["database"]:
-            return st.secrets["database"]["url"]
+        if "SUPABASE_DB_URL" in st.secrets and st.secrets["SUPABASE_DB_URL"]:
+            return str(st.secrets["SUPABASE_DB_URL"]).strip()
+        if "database" in st.secrets and "url" in st.secrets["database"] and st.secrets["database"]["url"]:
+            return str(st.secrets["database"]["url"]).strip()
     except Exception:
         pass
-    return os.environ.get("SUPABASE_DB_URL", "")
-
-@st.cache_resource
-def get_db_engine():
-    """SQLAlchemy 커넥션 풀 싱글톤 관리 (@st.cache_resource)"""
-    db_url = get_db_url()
-    if not db_url:
-        return None
-    try:
-        from sqlalchemy import create_engine
-        engine = create_engine(
-            db_url,
-            pool_size=5,
-            max_overflow=10,
-            pool_timeout=15,
-            pool_recycle=1800,
-            pool_pre_ping=True
-        )
-        with engine.connect() as conn:
+        
+    # 2. OS 환경 변수 확인
+    env_url = os.environ.get("SUPABASE_DB_URL", "").strip()
+    if env_url:
+        return env_url
+        
+    # 3. 로컬 .streamlit/secrets.toml 직접 탐색
+    secrets_path = Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"
+    if secrets_path.exists():
+        try:
+            try:
+                import tomllib
+                with open(secrets_path, "rb") as f:
+                    s_data = tomllib.load(f)
+            except ImportError:
+                import toml
+                s_data = toml.load(str(secrets_path))
+            if "SUPABASE_DB_URL" in s_data and s_data["SUPABASE_DB_URL"]:
+                return str(s_data["SUPABASE_DB_URL"]).strip()
+            if "database" in s_data and "url" in s_data["database"] and s_data["database"]["url"]:
+                return str(s_data["database"]["url"]).strip()
+        except Exception:
             pass
-        return engine
-    except Exception:
+            
+    return ""
+
+@st.cache_resource(show_spinner=False)
+def _connect_postgres_cached(candidate_url: str):
+    """지정된 URL로 커넥션 풀을 생성하고 실제 핑(ping) 테스트를 거쳐 캐싱"""
+    from sqlalchemy import create_engine, text
+    engine = create_engine(
+        candidate_url,
+        pool_size=5,
+        max_overflow=10,
+        pool_timeout=8,
+        pool_recycle=1800,
+        pool_pre_ping=True,
+        connect_args={"connect_timeout": 4}
+    )
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1;"))
+    return engine
+
+def get_db_engine():
+    """Supabase 연결 후보들을 순차적으로 검증하여 연결 가능한 최적의 엔진을 반환 (연결 가능 시 무조건 Supabase 우선)"""
+    primary_url = get_db_url()
+    if not primary_url:
+        DB_DIAGNOSTICS["supabase_configured"] = False
+        DB_DIAGNOSTICS["supabase_connected"] = False
+        DB_DIAGNOSTICS["error_message"] = "SUPABASE_DB_URL이 설정되지 않았습니다."
         return None
+
+    DB_DIAGNOSTICS["supabase_configured"] = True
+    
+    # 프로젝트 Ref 식별
+    ref_match = re.search(r"postgres(?:\.([a-z0-9]+))?:[^@]+@(?:db\.([a-z0-9]+)\.supabase\.co|[a-z0-9.-]+)", primary_url)
+    if ref_match:
+        DB_DIAGNOSTICS["project_ref"] = ref_match.group(1) or ref_match.group(2)
+        
+    candidates = get_candidate_db_urls(primary_url)
+    last_error = None
+    results = []
+
+    for cand_url in candidates:
+        masked = mask_db_url(cand_url)
+        try:
+            engine = _connect_postgres_cached(cand_url)
+            DB_DIAGNOSTICS["supabase_connected"] = True
+            DB_DIAGNOSTICS["connected_url"] = cand_url
+            DB_DIAGNOSTICS["connected_host"] = extract_host_from_url(cand_url)
+            DB_DIAGNOSTICS["error_message"] = None
+            return engine
+        except Exception as e:
+            err_str = str(e).strip()
+            first_err_line = err_str.split("\n")[0]
+            if "could not translate host name" in err_str:
+                err_summary = "DNS 조회 실패 (호스트 주소를 찾을 수 없음)"
+            elif "tenant/user" in err_str and "not found" in err_str:
+                err_summary = f"프로젝트(Tenant) 미발견 ({DB_DIAGNOSTICS['project_ref']}) — 일시정지(Paused) 상태 가능성 높음"
+            elif "password authentication failed" in err_str:
+                err_summary = "DB 비밀번호 인증 실패"
+            elif "Connection refused" in err_str:
+                err_summary = "DB 포트 접속 거부 (서버 다운 또는 방화벽)"
+            elif "timeout" in err_str.lower():
+                err_summary = "접속 시간 초과 (4초 Timeout)"
+            else:
+                err_summary = first_err_line[:120]
+                
+            results.append((masked, err_summary))
+            last_error = err_summary
+
+    DB_DIAGNOSTICS["supabase_connected"] = False
+    DB_DIAGNOSTICS["candidate_results"] = results
+    DB_DIAGNOSTICS["error_message"] = last_error or "연결 실패"
+    return None
 
 def is_postgres():
     return get_db_engine() is not None
@@ -1128,8 +1311,8 @@ def auto_sync_missing_hwps():
 
 
 @st.cache_resource
-def ensure_db_initialized():
-    """앱 기동 시 DB 초기화, 레거시 데이터 정규화, 누락된 HWP 파일 자동 동기화 1회 보장"""
+def ensure_db_initialized(is_pg_mode: bool):
+    """앱 기동 시 DB 초기화, 레거시 데이터 정규화, 누락된 HWP 파일 자동 동기화 1회 보장 (DB 모드별 개별 캐싱)"""
     init_db()
     ins, err, items = auto_sync_missing_hwps()
     return {"inserted": ins, "errors": err, "items": items}
@@ -1141,17 +1324,48 @@ def ensure_db_initialized():
 st.set_page_config(page_title="금융 규정 검색 시스템", layout="wide", page_icon="⚡")
 
 # 앱 구동 시 DB 연결 및 스키마 검증/레거시 데이터 정규화 및 누락 HWP 자동 동기화 1회 자동 실행
-sync_result = ensure_db_initialized()
+sync_result = ensure_db_initialized(is_postgres())
 db_stats = get_db_stats()
 
 with st.sidebar:
     st.subheader("🗄️ 데이터베이스 연결 현황")
     if is_postgres():
         st.success("🟢 **온라인 DB (Supabase PostgreSQL)**")
-        st.caption("✅ 클라우드 DB 연결됨 — 업로드 시 데이터가 영구 보존됩니다.")
+        conn_host = DB_DIAGNOSTICS.get("connected_host") or "Supabase Cloud"
+        st.caption(f"✅ 클라우드 연결됨 (`{conn_host}`) — 업로드/변경 시 데이터가 영구 보존됩니다.")
     else:
-        st.warning("📁 **로컬 DB (SQLite)**")
-        st.caption("⚠️ 로컬 모드: Streamlit Cloud 배포 시 재부팅마다 초기화되므로, 영구 저장을 위해 Secrets에 SUPABASE_DB_URL을 설정해주세요.")
+        if DB_DIAGNOSTICS.get("supabase_configured"):
+            st.error("🔴 **Supabase 연결 불가 (로컬 SQLite 대체 작동 중)**")
+            err_msg = DB_DIAGNOSTICS.get("error_message") or "원인 미상"
+            project_ref = DB_DIAGNOSTICS.get("project_ref")
+            
+            st.warning(f"⚠️ **실패 사유**: {err_msg}")
+            
+            with st.expander("🛠️ 해결 방법 (프로젝트 복원 안내)", expanded=True):
+                if project_ref:
+                    dashboard_url = f"https://supabase.com/dashboard/project/{project_ref}"
+                    st.markdown(
+                        f"1. **Supabase 프로젝트 일시정지 확인**:\n"
+                        f"   Supabase 무료 티어는 7일간 접속이 없으면 자동으로 인스턴스가 일시정지(Paused)됩니다.\n\n"
+                        f"2. 👉 **[Supabase 프로젝트 복원 바로가기]({dashboard_url})**\n"
+                        f"   대시보드에서 **[Restore project]** 버튼을 클릭하시면 1~2분 내로 활성화됩니다.\n\n"
+                        f"3. 활성화 후 아래 버튼을 클릭하면 즉시 온라인 모드로 재연결됩니다."
+                    )
+                else:
+                    st.markdown(
+                        "1. Supabase 대시보드에서 프로젝트 상태를 확인해주세요.\n\n"
+                        "2. `.streamlit/secrets.toml`의 `SUPABASE_DB_URL` 정보를 확인해주세요."
+                    )
+                
+                if st.button("🔄 Supabase 다시 연결", type="primary", use_container_width=True):
+                    _connect_postgres_cached.clear()
+                    ensure_db_initialized.clear()
+                    clear_db_cache()
+                    st.rerun()
+            st.caption("ℹ️ 현재는 로컬 DB(`regulation_master.db`)를 읽어 정상 검색이 가능합니다. (새로 추가한 데이터는 로컬에만 반영됨)")
+        else:
+            st.warning("📁 **로컬 DB (SQLite)**")
+            st.caption("⚠️ SUPABASE_DB_URL이 설정되지 않아 로컬 SQLite 모드로 동작합니다. 영구 저장을 위해 Secrets에 URL을 등록해주세요.")
     st.caption(f"📊 실데이터: **{db_stats['reg_count']}개 규정** / **{db_stats['row_count']:,}건 조항**")
     st.caption("※ 모든 규정 목록과 검색은 DB 실데이터를 직접 조회합니다.")
     st.markdown("---")
