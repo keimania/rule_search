@@ -137,10 +137,33 @@ def is_external_prefixed(content: str, start: int, is_rule: bool) -> bool:
     return False
 
 # =========================================================
-# 신구대조표 (Inline Diff 시각화)
+# 신구대조표 및 변경 감지 (띄어쓰기·문장부호 무시 및 Inline Diff 시각화)
 # =========================================================
+def normalize_comparable_text(text: str) -> str:
+    """
+    조항 개정 비교를 위한 정규화:
+    - 띄어쓰기(공백, 줄바꿈) 무시
+    - 마침표(.), 쉼표(,), 따옴표, 괄호 등 단순 문장부호 유무 무시
+    """
+    if not text:
+        return ""
+    # 따옴표 및 전각 기호 통일
+    t = text.replace('“', '"').replace('”', '"').replace('‘', "'").replace('’', "'")
+    t = t.replace('（', '(').replace('）', ')').replace('＜', '<').replace('＞', '>')
+    # 공백, 마침표, 쉼표 등 문장부호 제거하여 실질 텍스트만 비교
+    return re.sub(r'[\s\.\,·~;:\'\"]', '', t)
+
+def is_substantive_change(old_text: str, new_text: str) -> bool:
+    """두 텍스트 사이에 단순 띄어쓰기나 마침표(.) 유무를 넘어선 실질적 내용 변경이 있는지 판별"""
+    if old_text is None or new_text is None:
+        return old_text != new_text
+    return normalize_comparable_text(old_text) != normalize_comparable_text(new_text)
+
 def generate_inline_diff_html(old_text: str, new_text: str) -> str:
-    """이전 텍스트와 현재 텍스트의 어절/단어 단위 변경 사항을 시각화하는 인라인 Diff HTML 생성"""
+    """
+    이전 텍스트와 현재 텍스트의 어절/단어 단위 실질 변경 사항을 시각화하는 인라인 Diff HTML 생성.
+    단순 띄어쓰기나 마침표(.) 유무 등 사소한 표기 차이는 변경으로 강조하지 않고 자연스럽게 유지합니다.
+    """
     if not old_text and not new_text:
         return ""
     if not old_text:
@@ -148,8 +171,10 @@ def generate_inline_diff_html(old_text: str, new_text: str) -> str:
     if not new_text:
         return f'<del style="background-color: #ffeef0; color: #cb2431; text-decoration: line-through; padding: 2px 4px; border-radius: 3px;">{html.escape(old_text)}</del>'
 
-    old_tokens = re.findall(r'\S+|\s+', old_text)
-    new_tokens = re.findall(r'\S+|\s+', new_text)
+    # 한글/영문/숫자 단어, 문장부호 및 기호, 공백을 세밀하게 분리하여 토큰화
+    token_pattern = re.compile(r'[가-힣\w]+|[^\w\s]|\s+')
+    old_tokens = token_pattern.findall(old_text)
+    new_tokens = token_pattern.findall(new_text)
 
     matcher = difflib.SequenceMatcher(None, old_tokens, new_tokens)
     result = []
@@ -159,7 +184,10 @@ def generate_inline_diff_html(old_text: str, new_text: str) -> str:
         new_chunk = "".join(new_tokens[j1:j2])
 
         if tag == 'equal':
-            result.append(html.escape(old_chunk))
+            result.append(html.escape(new_chunk))
+        elif normalize_comparable_text(old_chunk) == normalize_comparable_text(new_chunk):
+            # 단순 띄어쓰기나 마침표/쉼표 등 기호 유무 차이는 변경으로 표시하지 않음
+            result.append(html.escape(new_chunk))
         elif tag == 'delete':
             esc_old = html.escape(old_chunk)
             result.append(f'<del style="background-color: #ffeef0; color: #cb2431; text-decoration: line-through; padding: 2px 4px; border-radius: 3px; margin: 0 1px;">{esc_old}</del>')

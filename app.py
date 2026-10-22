@@ -43,6 +43,7 @@ from modules.citation_parser import (
     highlight_spans,
     generate_inline_diff_html,
     extract_outgoing_citations,
+    is_substantive_change,
 )
 
 from modules.hwp_converter import (
@@ -468,7 +469,7 @@ elif menu == MENU_NAMES["4"]:
                         for _, row in group.iterrows():
                             if prev is None:
                                 badge, color = "🆕 신설", "blue"
-                            elif prev != row['content']:
+                            elif is_substantive_change(prev, row['content']):
                                 badge, color = "✏️ 변경", "orange"
                             else:
                                 badge, color = "─ 유지", "grey"
