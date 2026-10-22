@@ -41,6 +41,8 @@ from modules.citation_parser import (
     classify_reference,
     find_valid_internal_matches,
     highlight_spans,
+    generate_inline_diff_html,
+    extract_outgoing_citations,
 )
 
 from modules.hwp_converter import (
@@ -107,6 +109,9 @@ from modules.queries import (
     get_menu6_keyword_search,
     get_target_article_content,
     get_menu7_reference_analysis,
+    parse_search_query,
+    export_dataframe_to_excel,
+    export_menu7_to_excel,
 )
 
 # =========================================================
@@ -444,6 +449,7 @@ elif menu == MENU_NAMES["3"]:
 
 elif menu == MENU_NAMES["4"]:
     st.subheader("🕰️ 조항 변경 이력 추적")
+    st.caption("조항 번호를 입력하여 역대 개정 이력과 개정 전·후 신구대조표(Inline Diff)를 조회합니다.")
     if reg_names:
         c1, c2 = st.columns(2)
         with c1:
@@ -468,7 +474,15 @@ elif menu == MENU_NAMES["4"]:
                                 badge, color = "─ 유지", "grey"
                             st.markdown(f":{color}[**[{row['reg_date']}] {badge}**]")
                             if badge == "✏️ 변경":
-                                st.code(row['content'], language=None)
+                                diff_html = generate_inline_diff_html(prev, row['content'])
+                                st.markdown(
+                                    f"<div style='background-color:#f8f9fa; padding:12px; border-radius:6px; border:1px solid #e9ecef; margin-bottom:8px; line-height:1.6;'>{diff_html}</div>",
+                                    unsafe_allow_html=True
+                                )
+                                with st.expander("📄 개정 후 전문 보기", expanded=False):
+                                    st.caption(row['content'])
+                            elif badge == "🆕 신설":
+                                st.markdown(f"> {row['content']}")
                             else:
                                 st.caption(row['content'])
                             st.divider()
@@ -496,6 +510,7 @@ elif menu == MENU_NAMES["5"]:
 
 elif menu == MENU_NAMES["6"]:
     st.subheader("🔍 통합 키워드 검색")
+    st.caption("💡 **복합 검색 연산자 지원**: 공백(AND) · `|` (OR) · `-` (NOT 제외) (예: `공매도 호가` / `거래정지 | 중단` / `정리매매 -세칙`)")
     if reg_names:
         with st.form("keyword_search_form", border=False):
             c1, c2 = st.columns([1, 2])
@@ -503,7 +518,7 @@ elif menu == MENU_NAMES["6"]:
                 target = st.selectbox("대상", ["전체 규정 (All)"] + reg_names, index=0)
                 latest = st.checkbox("최신 규정만", value=True)
             with c2:
-                keyword = st.text_input("검색어", placeholder="예: 공매도")
+                keyword = st.text_input("검색어", placeholder="예: 공매도 호가 / 거래정지 | 중단")
                 btn = st.form_submit_button("검색", type="primary")
 
         if btn and keyword:
@@ -512,10 +527,38 @@ elif menu == MENU_NAMES["6"]:
                 st.warning("결과 없음")
             else:
                 st.success(f"총 {len(df)}건 검색됨")
+                
+                # 엑셀 / CSV 다운로드 버튼
+                col_dl1, col_dl2 = st.columns(2)
+                safe_kw = keyword.replace(" ", "_").replace("|", "OR").replace("-", "NOT")
+                with col_dl1:
+                    excel_bytes = export_dataframe_to_excel(df, sheet_name="통합키워드검색")
+                    st.download_button(
+                        label="📥 검색결과 엑셀(.xlsx) 다운로드",
+                        data=excel_bytes,
+                        file_name=f"검색결과_{safe_kw}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+                with col_dl2:
+                    csv_bytes = df.to_csv(index=False).encode('utf-8-sig')
+                    st.download_button(
+                        label="📥 검색결과 CSV 다운로드",
+                        data=csv_bytes,
+                        file_name=f"검색결과_{safe_kw}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+
                 if len(df) > 200:
                     st.warning("⚠️ 결과가 너무 많아 일부만 표시될 수 있습니다.")
                     
-                kw_variants = get_hang_variants(keyword)
+                branches = parse_search_query(keyword)
+                kw_variants = []
+                for b in branches:
+                    for word in b.get("must", []):
+                        kw_variants.extend(get_hang_variants(word) or [word])
+
                 for _, row in df.iterrows():
                     with st.container(border=True):
                         st.markdown(f"**📌 [{row['regulation_name']}] {row['ref_no']} {row['article_title']}** :grey[{row['reg_date']}]")
@@ -527,7 +570,7 @@ elif menu == MENU_NAMES["6"]:
 
 elif menu == MENU_NAMES["7"]:
     st.subheader("🔗 조항 인용 및 역참조 분석")
-    st.info("특정 규정의 조항이 내/외부에서 어떻게 인용되고 있는지 분석합니다.")
+    st.caption("특정 규정의 조항이 내/외부에서 어떻게 인용되고 있는지(역참조), 그리고 해당 조항이 무엇을 참조하고 있는지(정방향) 종합 분석합니다.")
     
     if reg_names:
         with st.form("ref_analysis_form", border=False):
@@ -558,6 +601,21 @@ elif menu == MENU_NAMES["7"]:
                         st.markdown(f"**{sub_ref}**")
                         st.markdown(f"> {row['content']}")
                         st.markdown("")
+
+                # 1-1. 정방향 참조 (해당 조항이 인용하고 있는 조항들) 추출 및 팝오버 뷰어
+                combined_content = "\n".join(df_target['content'].tolist())
+                outgoing_list = extract_outgoing_citations(combined_content, curr_reg=target_reg)
+                if outgoing_list:
+                    st.markdown("##### ↗️ **[정방향 참조] 본 조항이 인용하고 있는 타 규정 및 조항**")
+                    badge_strs = [f"`{item['full_label']}`" for item in outgoing_list]
+                    st.markdown(" ".join(badge_strs))
+                    with st.popover(f"🔍 정방향 인용 조항 상세 목록 ({len(outgoing_list)}건)"):
+                        st.markdown(f"**[{target_reg} {clean_art}] 본문에서 인용 중인 조항 목록**")
+                        out_df = pd.DataFrame([
+                            {"구분/접두어": item["prefix"], "인용 조항": item["clause"], "원문 표기": item["raw"]}
+                            for item in outgoing_list
+                        ])
+                        st.dataframe(out_df, hide_index=True, use_container_width=True)
             else:
                 st.warning(f"⚠️ 선택하신 규정({target_reg})에서 '{clean_art}' 조항의 원문을 찾을 수 없습니다. (조항 번호를 확인해주세요)")
 
@@ -576,7 +634,7 @@ elif menu == MENU_NAMES["7"]:
                 
                 int_spans, part_spans, ext_spans = [], [], []
                 for c in citations:
-                    if match_article(c['clause'], variants):
+                    if match_article(c, variants):
                         cat = classify_reference(curr_reg, target_reg, partner_reg_name, c['gov_prefix'])
                         if cat == "internal":
                             int_spans.append(c['span'])
@@ -593,7 +651,27 @@ elif menu == MENU_NAMES["7"]:
                     results_external.append((row, ext_spans))
 
             st.success(f"분석 완료: 내부 {len(results_internal)}건 / {partner_reg_name} {len(results_partner)}건 / 타 규정 {len(results_external)}건")
-            
+
+            # 엑셀 다운로드 버튼
+            excel_m7_bytes = export_menu7_to_excel(
+                df_target=df_target,
+                results_internal=results_internal,
+                results_partner=results_partner,
+                results_external=results_external,
+                target_reg=target_reg,
+                clean_art=clean_art,
+                partner_reg_name=partner_reg_name
+            )
+            safe_reg = target_reg.replace(" ", "_")
+            st.download_button(
+                label="📥 인용 분석 결과 엑셀(.xlsx) 다운로드",
+                data=excel_m7_bytes,
+                file_name=f"인용분석_{safe_reg}_{clean_art}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                help="관심 조항 원문 및 내부/파트너/타규정 참조 분석 결과를 각각의 시트로 분리하여 저장합니다."
+            )
+            st.write("")
+
             st.markdown(f"### 🏠 [{target_reg}] 내부 참조")
             if results_internal:
                 for row, spans in results_internal:
@@ -604,7 +682,7 @@ elif menu == MENU_NAMES["7"]:
                 st.caption("결과 없음")
 
             st.markdown(f"### 🤝 [{partner_reg_name}] 참조")
-            st.caption("※ 연속 조항 열거(예: '규정 제6조, 제25조') 및 하위 항·호 인용까지 지배 접두어 문맥을 자동 반영하여 분석합니다.")
+            st.caption("※ 연속 조항 열거(예: '규정 제6조, 제25조') 및 조문 범위 인용('제A조부터 제B조까지'), 대명사 문맥을 자동 반영하여 분석합니다.")
             if results_partner:
                 for row, spans in results_partner:
                     with st.container(border=True):
