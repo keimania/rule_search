@@ -301,6 +301,37 @@ def export_dataframe_to_excel(df: pd.DataFrame, sheet_name: str = "검색결과"
         df.to_excel(writer, sheet_name=sheet_name[:30], index=False)
     return output.getvalue()
 
+def export_full_text_to_txt(df: pd.DataFrame, target_reg: str, reg_date: str) -> str:
+    """규정 전문을 깔끔한 법조문 텍스트 형식(.txt)으로 변환"""
+    lines = [
+        f"============================================================",
+        f"【규정명】 {target_reg}",
+        f"【시행일자】 {reg_date}",
+        f"============================================================\n"
+    ]
+    for _, row in df.iterrows():
+        ref_no = str(row.get("조항") or row.get("ref_no") or "").strip()
+        title = str(row.get("조명") or row.get("article_title") or "").strip()
+        content = str(row.get("내용") or row.get("content") or "").strip()
+
+        header = f"[{ref_no}]"
+        if title:
+            header += f" {title}"
+        lines.append(header)
+        lines.append(content)
+        lines.append("")
+    return "\n".join(lines)
+
+def export_history_to_excel(df: pd.DataFrame, target_reg: str, ref_no: str) -> bytes:
+    """메뉴 4 조항 변경 이력 추적 결과를 엑셀(.xlsx) 파일로 변환"""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        if not df.empty:
+            df.to_excel(writer, sheet_name="조항변경이력", index=False)
+        else:
+            pd.DataFrame([{"안내": "검색 결과가 없습니다."}]).to_excel(writer, sheet_name="결과없음", index=False)
+    return output.getvalue()
+
 def export_menu7_to_excel(df_target: pd.DataFrame, results_internal: list, results_partner: list, results_external: list, target_reg: str, clean_art: str, partner_reg_name: str) -> bytes:
     """메뉴 7 역참조 분석 결과를 다중 시트 엑셀(.xlsx) 파일로 변환"""
     output = io.BytesIO()

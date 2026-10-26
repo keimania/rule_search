@@ -112,6 +112,8 @@ from modules.queries import (
     get_menu7_reference_analysis,
     parse_search_query,
     export_dataframe_to_excel,
+    export_full_text_to_txt,
+    export_history_to_excel,
     export_menu7_to_excel,
 )
 
@@ -398,14 +400,26 @@ with st.sidebar:
     # 기능 선택 (항상 노출 — 사용자가 바로 접근)
     # =====================================================
     st.header("🔍 기능 선택")
-    menu = st.radio("메뉴 선택", list(MENU_NAMES.values()))
+    menu_options = list(MENU_NAMES.values())
+    if "selected_menu" not in st.session_state or st.session_state["selected_menu"] not in menu_options:
+        st.session_state["selected_menu"] = menu_options[0]
+
+    menu_idx = menu_options.index(st.session_state["selected_menu"])
+    menu = st.radio(
+        "메뉴 선택",
+        menu_options,
+        index=menu_idx,
+        key="main_menu_radio"
+    )
+    st.session_state["selected_menu"] = menu
 
 st.title(f"⚡ {menu}")
 
 reg_names = get_regulation_names()
 default_reg_index = 0
-if PREFERRED_REG_NAME in reg_names:
-    default_reg_index = reg_names.index(PREFERRED_REG_NAME)
+preferred_target = st.session_state.get("nav_target_reg") or PREFERRED_REG_NAME
+if preferred_target in reg_names:
+    default_reg_index = reg_names.index(preferred_target)
 
 # =========================================================
 # 메뉴별 렌더링 로직
@@ -416,8 +430,36 @@ if menu == MENU_NAMES["1"]:
     st.caption("※ 본 목록은 '규정' 폴더의 파일 목록이 아닌, **실제 데이터베이스(DB)에 적재된 실데이터**를 집계하여 실시간으로 표시합니다.")
     df_summary = get_menu1_summary()
     if not df_summary.empty:
-        st.dataframe(df_summary, width='stretch', hide_index=True)
-        st.caption(f"📊 총 {len(df_summary)}개 규정 / {df_summary['총 조항(레코드) 수'].sum():,}건 조항 등록됨")
+        # 1. 상단 대시보드 요약 메트릭
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("🏛️ 등록 규정 수", f"{len(df_summary)}개")
+        m2.metric("📅 누적 개정본 수", f"{df_summary['개정본 수'].sum():,}회")
+        m3.metric("📄 총 조항(레코드)", f"{df_summary['총 조항(레코드) 수'].sum():,}건")
+        m4.metric("🕒 최근 업데이트 일자", str(df_summary['최신 개정일자'].max()))
+        
+        st.write("")
+        # 2. 실시간 검색 필터 및 엑셀 다운로드
+        col_f1, col_f2 = st.columns([3, 1])
+        with col_f1:
+            search_reg = st.text_input("🔍 규정명 실시간 필터", placeholder="예: 유가증권, 파생, 코스닥, 시장감시 등 입력 시 즉시 필터링")
+        with col_f2:
+            st.write("")
+            st.write("")
+            excel_bytes = export_dataframe_to_excel(df_summary, sheet_name="등록규정목록")
+            st.download_button(
+                label="📥 목록 엑셀(.xlsx) 다운로드",
+                data=excel_bytes,
+                file_name="KRX_규정목록_집계.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+            
+        filtered_df = df_summary
+        if search_reg.strip():
+            filtered_df = df_summary[df_summary["규정명"].str.contains(search_reg.strip(), case=False, na=False)]
+            st.caption(f"검색 결과: 총 {len(filtered_df)}건 / {len(df_summary)}건")
+
+        st.dataframe(filtered_df, width='stretch', hide_index=True)
     else:
         st.info("데이터베이스에 등록된 규정 데이터가 없습니다. 사이드바의 '참고 자료 관리'에서 HWP/CSV를 DB에 등록해주세요.")
 
@@ -427,44 +469,165 @@ elif menu == MENU_NAMES["2"]:
     if reg_names:
         target = st.selectbox("규정 선택", reg_names, index=default_reg_index)
         df_dates = get_menu2_history(target)
-        st.write(f"**{target}** 개정일 목록 (DB 실데이터 기준 총 {len(df_dates)}개 개정본):")
-        st.dataframe(df_dates, width='stretch', hide_index=True)
+        if not df_dates.empty:
+            m1, m2, m3 = st.columns(3)
+            m1.metric("총 개정본 수", f"{len(df_dates)}회")
+            m2.metric("최신 개정일자", str(df_dates.iloc[0]["개정일자"]))
+            m3.metric("최초 제정/개정일자", str(df_dates.iloc[-1]["개정일자"]))
+
+            col_down, _ = st.columns([1, 2])
+            with col_down:
+                excel_bytes = export_dataframe_to_excel(df_dates, sheet_name=f"{target[:25]}_개정일")
+                safe_reg = target.replace(" ", "_")
+                st.download_button(
+                    label=f"📥 [{target}] 개정일 목록 엑셀 다운로드",
+                    data=excel_bytes,
+                    file_name=f"{safe_reg}_개정일목록.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+
+            st.write(f"**{target}** 개정일 목록 (DB 실데이터 기준 총 {len(df_dates)}개 개정본):")
+            st.dataframe(df_dates, width='stretch', hide_index=True)
+        else:
+            st.info("해당 규정에 등록된 개정일자 데이터가 없습니다.")
     else:
         st.info("데이터가 없습니다.")
 
 elif menu == MENU_NAMES["3"]:
     st.subheader("📖 규정 전문 조회")
+    st.caption("선택한 규정의 특정 시행일자 전체 전문을 열람하고, 조항별 검색 및 엑셀/텍스트 파일로 내려받을 수 있습니다.")
     if reg_names:
         c1, c2 = st.columns(2)
         with c1:
-            target = st.selectbox("규정", reg_names, index=default_reg_index)
+            target = st.selectbox("규정", reg_names, index=default_reg_index, key="menu3_target_reg")
         dates = get_regulation_dates(target)
         with c2:
-            date = st.selectbox("날짜", dates) if dates else st.selectbox("날짜", [])
+            date = st.selectbox("날짜", dates, key="menu3_date") if dates else st.selectbox("날짜", [], key="menu3_date_empty")
         
-        if st.button("조회"):
+        col_btn1, col_btn2 = st.columns([1, 4])
+        with col_btn1:
+            query_clicked = st.button("전문 조회", type="primary", use_container_width=True)
+
+        if query_clicked or ("menu3_last_key" in st.session_state and st.session_state["menu3_last_key"] == f"{target}_{date}"):
+            st.session_state["menu3_last_key"] = f"{target}_{date}"
             df = get_menu3_full_text(target, date)
-            st.dataframe(df, width='stretch', height=600)
+            if df.empty:
+                st.warning("선택하신 조건에 해당하는 규정 전문 데이터가 없습니다.")
+            else:
+                st.session_state["menu3_df"] = df
+                st.session_state["menu3_target"] = target
+                st.session_state["menu3_date"] = date
+
+        if "menu3_df" in st.session_state and st.session_state.get("menu3_last_key") == f"{target}_{date}":
+            df = st.session_state["menu3_df"]
+            st.success(f"**[{target}] {date}** 전문 (총 {len(df):,}개 조항/항목)")
+
+            # 다운로드 버튼 영역 (엑셀 & 텍스트)
+            col_dl1, col_dl2 = st.columns(2)
+            safe_reg = target.replace(" ", "_")
+            with col_dl1:
+                excel_bytes = export_dataframe_to_excel(df, sheet_name=f"{target[:20]}_{date}")
+                st.download_button(
+                    label="📥 규정 전문 엑셀(.xlsx) 다운로드",
+                    data=excel_bytes,
+                    file_name=f"{safe_reg}_{date}_전문.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+            with col_dl2:
+                txt_data = export_full_text_to_txt(df, target, date)
+                st.download_button(
+                    label="📥 규정 전문 텍스트(.txt) 다운로드",
+                    data=txt_data.encode('utf-8-sig'),
+                    file_name=f"{safe_reg}_{date}_전문.txt",
+                    mime="text/plain",
+                    use_container_width=True
+                )
+
+            # 전문 내 실시간 필터
+            filter_query = st.text_input("🔍 전문 내 조항 번호 또는 본문 키워드 필터링", placeholder="예: 제20조, 공매도, 상장폐지 등 입력 시 해당 조문만 필터링", key="menu3_filter")
+            
+            view_df = df
+            if filter_query.strip():
+                kw = filter_query.strip()
+                cond = view_df['조항'].str.contains(kw, case=False, na=False) | \
+                       view_df['조명'].str.contains(kw, case=False, na=False) | \
+                       view_df['내용'].str.contains(kw, case=False, na=False)
+                view_df = view_df[cond]
+                st.caption(f"필터 결과: {len(view_df):,}건 / 전체 {len(df):,}건")
+
+            tab_reader, tab_table = st.tabs(["📑 법조문 리더 뷰 (가독성)", "📊 데이터 표 뷰 (전체 목록)"])
+
+            with tab_reader:
+                if view_df.empty:
+                    st.info("필터 조건에 부합하는 조항이 없습니다.")
+                else:
+                    st.caption("※ 각 조문별 제목과 내용이 정돈되어 가독성이 높으며, 우측 상단 복사 기능을 활용할 수 있습니다.")
+                    limit_rows = min(len(view_df), 150)
+                    for i in range(limit_rows):
+                        row = view_df.iloc[i]
+                        r_ref = row['조항']
+                        r_title = f" ({row['조명']})" if row['조명'] else ""
+                        with st.container(border=True):
+                            st.markdown(f"**📌 {r_ref}{r_title}**")
+                            st.markdown(f"> {row['내용']}")
+                    if len(view_df) > 150:
+                        st.info(f"💡 전체 {len(view_df)}건 중 상위 150건을 표시했습니다. 특정 조항을 찾으시려면 상단 필터창을 이용하세요.")
+
+            with tab_table:
+                st.dataframe(view_df, width='stretch', height=600, hide_index=True)
     else:
         st.info("데이터베이스에 등록된 규정 데이터가 없습니다.")
 
 elif menu == MENU_NAMES["4"]:
     st.subheader("🕰️ 조항 변경 이력 추적")
-    st.caption("조항 번호를 입력하여 역대 개정 이력과 개정 전·후 신구대조표(Inline Diff)를 조회합니다.")
+    st.caption("조항 번호를 입력하여 역대 개정 이력과 개정 전·후 신구대조표(Inline Diff)를 조회합니다. (예: `20`, `20-2`, `20조의2` 등 간편 입력 지원)")
     if reg_names:
         c1, c2 = st.columns(2)
         with c1:
-            target = st.selectbox("규정", reg_names, index=default_reg_index)
+            target = st.selectbox("규정", reg_names, index=default_reg_index, key="menu4_target_reg")
+        default_ref = st.session_state.get("nav_target_art") or DEFAULT_ART_NO
         with c2:
-            ref = st.text_input("조항 번호", value=DEFAULT_ART_NO)
+            ref = st.text_input("조항 번호", value=default_ref, key="menu4_ref_no", help="숫자만 입력(20)하거나 하이픈(20-2) 등 약어로도 자동 변환됩니다.")
         
-        if st.button("히스토리 검색"):
+        col_btn, col_opt = st.columns([1, 2])
+        with col_btn:
+            search_clicked = st.button("히스토리 검색", type="primary", use_container_width=True)
+        with col_opt:
+            only_diff_opt = st.checkbox("✏️ 실질 변경(신설·수정)된 개정본만 보기", value=False, key="menu4_only_diff")
+
+        if search_clicked or ("menu4_last_key" in st.session_state and st.session_state["menu4_last_key"] == f"{target}_{ref}"):
+            st.session_state["menu4_last_key"] = f"{target}_{ref}"
             df = get_menu4_history(target, ref)
+            st.session_state["menu4_df"] = df
+
+        if "menu4_df" in st.session_state and st.session_state.get("menu4_last_key") == f"{target}_{ref}":
+            df = st.session_state["menu4_df"]
             if df.empty:
-                st.warning("결과가 없습니다.")
+                st.warning(f"선택하신 규정({target})에서 '{ref}'에 부합하는 조항 이력을 찾을 수 없습니다. (입력 형식 확인: 예. 제20조 또는 20)")
             else:
+                # 엑셀 다운로드 버튼
+                safe_reg = target.replace(" ", "_")
+                clean_ref_name = normalize_art_input(ref)
+                excel_bytes = export_history_to_excel(df, target, clean_ref_name)
+                st.download_button(
+                    label=f"📥 [{clean_ref_name}] 개정 이력 엑셀(.xlsx) 다운로드",
+                    data=excel_bytes,
+                    file_name=f"개정이력_{safe_reg}_{clean_ref_name}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+
                 for r_no, group in df.groupby('ref_no'):
-                    with st.expander(f"📌 {r_no} ({group.iloc[0]['article_title']})", expanded=True):
+                    total_revs = len(group)
+                    prev_check = None
+                    mod_count = 0
+                    for _, r_check in group.iterrows():
+                        if prev_check is not None and is_substantive_change(prev_check, r_check['content']):
+                            mod_count += 1
+                        prev_check = r_check['content']
+
+                    with st.expander(f"📌 {r_no} ({group.iloc[0]['article_title']}) — 총 {total_revs}회 개정본 (실질 변경 {mod_count}회)", expanded=True):
                         prev = None
                         for _, row in group.iterrows():
                             if prev is None:
@@ -473,6 +636,11 @@ elif menu == MENU_NAMES["4"]:
                                 badge, color = "✏️ 변경", "orange"
                             else:
                                 badge, color = "─ 유지", "grey"
+
+                            if only_diff_opt and badge == "─ 유지":
+                                prev = row['content']
+                                continue
+
                             st.markdown(f":{color}[**[{row['reg_date']}] {badge}**]")
                             if badge == "✏️ 변경":
                                 diff_html = generate_inline_diff_html(prev, row['content'])
@@ -493,25 +661,77 @@ elif menu == MENU_NAMES["4"]:
 
 elif menu == MENU_NAMES["5"]:
     st.subheader("🔎 특정 시점 조항 상세 조회")
+    st.caption("규정, 시행일자, 조항 번호를 지정하여 해당 시점의 정확한 조문 내용을 상세 열람하고 관련 기능으로 바로 연결합니다.")
     if reg_names:
         c1, c2, c3 = st.columns(3)
         with c1:
-            target = st.selectbox("규정", reg_names, index=default_reg_index)
+            target = st.selectbox("규정", reg_names, index=default_reg_index, key="menu5_target_reg")
         dates = get_regulation_dates(target)
         with c2:
-            date = st.selectbox("날짜", dates) if dates else st.selectbox("날짜", [])
+            date = st.selectbox("날짜", dates, key="menu5_date") if dates else st.selectbox("날짜", [], key="menu5_date_empty")
+        default_ref = st.session_state.get("nav_target_art") or DEFAULT_ART_NO
         with c3:
-            ref = st.text_input("조항 번호", value=DEFAULT_ART_NO)
+            ref = st.text_input("조항 번호", value=default_ref, key="menu5_ref_no", help="예: 20, 20-2, 제20조 등 간편 입력 가능")
         
-        if st.button("조회"):
+        if st.button("조회", type="primary"):
+            st.session_state["menu5_last_key"] = f"{target}_{date}_{ref}"
+
+        if st.session_state.get("menu5_last_key") == f"{target}_{date}_{ref}":
             df = get_menu5_detail(target, date, ref)
-            st.table(df)
+            if df.empty:
+                st.warning(f"선택하신 규정({target})의 {date} 시행본에서 '{ref}' 조항을 찾을 수 없습니다. (조항 번호 확인 요망)")
+            else:
+                clean_ref = normalize_art_input(ref)
+                st.success(f"조회 성공: **[{target}] {date}** 기준 {len(df)}건 조항 레코드")
+
+                # 빠른 액션 바로가기 버튼 영역
+                st.markdown("##### ⚡ 빠른 연계 분석")
+                col_act1, col_act2 = st.columns(2)
+                with col_act1:
+                    if st.button(f"🕰️ '{clean_ref}' 전체 개정 이력 추적 (메뉴 4로 이동)", use_container_width=True):
+                        st.session_state["selected_menu"] = MENU_NAMES["4"]
+                        st.session_state["nav_target_reg"] = target
+                        st.session_state["nav_target_art"] = clean_ref
+                        st.session_state["menu4_last_key"] = f"{target}_{clean_ref}"
+                        st.session_state["menu4_df"] = get_menu4_history(target, clean_ref)
+                        st.rerun()
+                with col_act2:
+                    if st.button(f"🔗 '{clean_ref}' 인용(역참조) 분석하기 (메뉴 7로 이동)", use_container_width=True):
+                        st.session_state["selected_menu"] = MENU_NAMES["7"]
+                        st.session_state["nav_target_reg"] = target
+                        st.session_state["nav_target_art"] = clean_ref
+                        st.rerun()
+
+                st.write("")
+                # 카드 형태로 예쁘게 렌더링
+                for _, row in df.iterrows():
+                    r_ref = row['조항']
+                    r_title = f" ({row['조명']})" if row['조명'] else ""
+                    with st.container(border=True):
+                        st.markdown(f"#### 📌 **[{target}] {r_ref}{r_title}** :grey[[시행일자: {date}]]")
+                        st.markdown(f"> {row['내용']}")
+                        with st.expander("📋 조문 복사용 텍스트", expanded=False):
+                            st.code(f"[{r_ref}{r_title}]\n{row['내용']}", language="text")
     else:
         st.info("데이터베이스에 등록된 규정 데이터가 없습니다.")
 
 elif menu == MENU_NAMES["6"]:
     st.subheader("🔍 통합 키워드 검색")
     st.caption("💡 **복합 검색 연산자 지원**: 공백(AND) · `|` (OR) · `-` (NOT 제외) (예: `공매도 호가` / `거래정지 | 중단` / `정리매매 -세칙`)")
+    
+    # 실무 빈출 추천 키워드 칩
+    st.markdown("##### 🏷️ 실무 빈출 추천 검색어")
+    recommend_kws = ["공매도", "매매거래정지", "상장폐지", "불공정거래", "시장조성자", "서킷브레이커", "정리매매", "대용증권"]
+    chips_cols = st.columns(len(recommend_kws))
+    for idx, kw_item in enumerate(recommend_kws):
+        with chips_cols[idx]:
+            if st.button(kw_item, key=f"kw_chip_{idx}", use_container_width=True):
+                st.session_state["keyword_search_input"] = kw_item
+                st.session_state["keyword_auto_submit"] = True
+                st.rerun()
+
+    current_kw_val = st.session_state.get("keyword_search_input", "")
+
     if reg_names:
         with st.form("keyword_search_form", border=False):
             c1, c2 = st.columns([1, 2])
@@ -519,16 +739,23 @@ elif menu == MENU_NAMES["6"]:
                 target = st.selectbox("대상", ["전체 규정 (All)"] + reg_names, index=0)
                 latest = st.checkbox("최신 규정만", value=True)
             with c2:
-                keyword = st.text_input("검색어", placeholder="예: 공매도 호가 / 거래정지 | 중단")
+                keyword = st.text_input("검색어", value=current_kw_val, placeholder="예: 공매도 호가 / 거래정지 | 중단")
                 btn = st.form_submit_button("검색", type="primary")
 
-        if btn and keyword:
+        auto_run = st.session_state.pop("keyword_auto_submit", False)
+        if (btn or auto_run) and keyword:
             df = get_menu6_keyword_search(target, keyword, latest)
             if df.empty:
                 st.warning("결과 없음")
             else:
-                st.success(f"총 {len(df)}건 검색됨")
+                st.success(f"총 {len(df):,}건 검색됨 (검색 대상: {target}, 최신규정만: {'예' if latest else '아니오'})")
                 
+                # 규정별 분포 요약 뱃지 (전체 규정 검색 시)
+                if target == "전체 규정 (All)":
+                    reg_counts = df['regulation_name'].value_counts()
+                    top_summary = " · ".join([f"**{r}** ({c}건)" for r, c in reg_counts.head(5).items()])
+                    st.info(f"📊 **주요 규정별 건수 분포 (상위 5개)**: {top_summary}")
+
                 # 엑셀 / CSV 다운로드 버튼
                 col_dl1, col_dl2 = st.columns(2)
                 safe_kw = keyword.replace(" ", "_").replace("|", "OR").replace("-", "NOT")
@@ -551,20 +778,29 @@ elif menu == MENU_NAMES["6"]:
                         use_container_width=True
                     )
 
-                if len(df) > 200:
-                    st.warning("⚠️ 결과가 너무 많아 일부만 표시될 수 있습니다.")
-                    
                 branches = parse_search_query(keyword)
                 kw_variants = []
                 for b in branches:
                     for word in b.get("must", []):
                         kw_variants.extend(get_hang_variants(word) or [word])
 
-                for _, row in df.iterrows():
-                    with st.container(border=True):
-                        st.markdown(f"**📌 [{row['regulation_name']}] {row['ref_no']} {row['article_title']}** :grey[{row['reg_date']}]")
-                        st.markdown(highlight_terms(row['content'], kw_variants, "red"))
-        elif btn and not keyword:
+                tab_card, tab_summary = st.tabs(["📑 상세 카드 뷰 (본문 하이라이트)", "📊 요약 표 뷰 (빠른 탐색)"])
+
+                with tab_card:
+                    if len(df) > 150:
+                        st.caption(f"💡 검색 결과가 많아 카드 뷰에서는 상위 150건을 우선 표시합니다. 전체 조문 목록은 '요약 표 뷰' 또는 엑셀 다운로드를 이용하세요.")
+                    limit_rows = min(len(df), 150)
+                    for i in range(limit_rows):
+                        row = df.iloc[i]
+                        with st.container(border=True):
+                            st.markdown(f"**📌 [{row['regulation_name']}] {row['ref_no']} {row['article_title']}** :grey[{row['reg_date']}]")
+                            st.markdown(highlight_terms(row['content'], kw_variants, "red"))
+
+                with tab_summary:
+                    summary_df = df[['regulation_name', 'reg_date', 'ref_no', 'article_title', 'content']].copy()
+                    summary_df.columns = ['규정명', '시행일자', '조항', '조명', '본문 내용']
+                    st.dataframe(summary_df, width='stretch', height=600, hide_index=True)
+        elif (btn or auto_run) and not keyword:
             st.warning("검색어를 입력해주세요.")
     else:
         st.info("데이터베이스에 등록된 규정 데이터가 없습니다.")
@@ -573,13 +809,25 @@ elif menu == MENU_NAMES["7"]:
     st.subheader("🔗 조항 인용 및 역참조 분석")
     st.caption("특정 규정의 조항이 내/외부에서 어떻게 인용되고 있는지(역참조), 그리고 해당 조항이 무엇을 참조하고 있는지(정방향) 종합 분석합니다.")
     
+    # 추천 조항 빠른 선택 칩
+    st.markdown("##### 💡 주요 관심 조항 빠른 선택")
+    quick_arts = ["제20조의2", "제14조", "제6조", "제25조", "제3조"]
+    q_cols = st.columns(len(quick_arts))
+    for idx, q_art in enumerate(quick_arts):
+        with q_cols[idx]:
+            if st.button(q_art, key=f"art_chip_{idx}", use_container_width=True):
+                st.session_state["target_art_input"] = q_art
+                st.rerun()
+
+    current_art_val = st.session_state.get("target_art_input") or st.session_state.get("nav_target_art") or DEFAULT_ART_NO
+
     if reg_names:
         with st.form("ref_analysis_form", border=False):
             col1, col2 = st.columns(2)
             with col1:
-                target_reg = st.selectbox("관심 규정", reg_names, index=default_reg_index)
+                target_reg = st.selectbox("관심 규정", reg_names, index=default_reg_index, key="menu7_reg_select")
             with col2:
-                target_art = st.text_input("관심 조항 번호", value=DEFAULT_ART_NO)
+                target_art = st.text_input("관심 조항 번호", value=current_art_val, key="menu7_art_input", help="예: 20, 20-2, 제20조의2 등 간편 입력 지원")
                 
             latest_only = st.checkbox("최신 규정 내용에서만 찾기 (권장)", value=True)
             search_btn = st.form_submit_button("인용 분석 시작", type="primary")
@@ -603,7 +851,7 @@ elif menu == MENU_NAMES["7"]:
                         st.markdown(f"> {row['content']}")
                         st.markdown("")
 
-                # 1-1. 정방향 참조 (해당 조항이 인용하고 있는 조항들) 추출 및 팝오버 뷰어
+                # 1-1. 정방향 참조 추출 및 팝오버 뷰어
                 combined_content = "\n".join(df_target['content'].tolist())
                 outgoing_list = extract_outgoing_citations(combined_content, curr_reg=target_reg)
                 if outgoing_list:
@@ -673,32 +921,41 @@ elif menu == MENU_NAMES["7"]:
             )
             st.write("")
 
-            st.markdown(f"### 🏠 [{target_reg}] 내부 참조")
-            if results_internal:
-                for row, spans in results_internal:
-                    with st.container(border=True):
-                        st.markdown(f"**📌 {row['ref_no']} {row['article_title']}** :grey[[시행일자: {row['reg_date']}]]")
-                        st.markdown(highlight_spans(row['content'], spans, "red"))
-            else:
-                st.caption("결과 없음")
+            # 탭 구조를 도입하여 스크롤 압박 없이 탭 클릭으로 전환 열람 가능!
+            tab_int, tab_part, tab_ext = st.tabs([
+                f"🏠 내부 참조 ({len(results_internal)}건)",
+                f"🤝 {partner_reg_name} 참조 ({len(results_partner)}건)",
+                f"🌏 타 규정 참조 ({len(results_external)}건)"
+            ])
 
-            st.markdown(f"### 🤝 [{partner_reg_name}] 참조")
-            st.caption("※ 연속 조항 열거(예: '규정 제6조, 제25조') 및 조문 범위 인용('제A조부터 제B조까지'), 대명사 문맥을 자동 반영하여 분석합니다.")
-            if results_partner:
-                for row, spans in results_partner:
-                    with st.container(border=True):
-                        st.markdown(f"**📌 {row['ref_no']} {row['article_title']}** :grey[[시행일자: {row['reg_date']}]]")
-                        st.markdown(highlight_spans(row['content'], spans, "blue"))
-            else:
-                st.caption("결과 없음")
+            with tab_int:
+                st.caption(f"※ 동일 규정([{target_reg}]) 내 다른 조항에서 본 조항을 인용한 내역입니다.")
+                if results_internal:
+                    for row, spans in results_internal:
+                        with st.container(border=True):
+                            st.markdown(f"**📌 {row['ref_no']} {row['article_title']}** :grey[[시행일자: {row['reg_date']}]]")
+                            st.markdown(highlight_spans(row['content'], spans, "red"))
+                else:
+                    st.caption("내부 참조 내역이 없습니다.")
 
-            st.markdown("### 🌏 타 규정 참조")
-            if results_external:
-                for row, spans in results_external:
-                    with st.container(border=True):
-                        st.markdown(f"**📌 [{row['regulation_name']}] {row['ref_no']} {row['article_title']}** :grey[[시행일자: {row['reg_date']}]]")
-                        st.markdown(highlight_spans(row['content'], spans, "green"))
-            else:
-                st.caption("결과 없음")
+            with tab_part:
+                st.caption(f"※ 연계 규정인 [{partner_reg_name}]에서 본 조항을 인용한 내역입니다. (연속 열거, 조문 범위 인용 자동 반영)")
+                if results_partner:
+                    for row, spans in results_partner:
+                        with st.container(border=True):
+                            st.markdown(f"**📌 {row['ref_no']} {row['article_title']}** :grey[[시행일자: {row['reg_date']}]]")
+                            st.markdown(highlight_spans(row['content'], spans, "blue"))
+                else:
+                    st.caption(f"{partner_reg_name} 참조 내역이 없습니다.")
+
+            with tab_ext:
+                st.caption("※ 기타 타 규정(공시규정, 상장규정 등)에서 본 조항을 명시적으로 인용한 내역입니다.")
+                if results_external:
+                    for row, spans in results_external:
+                        with st.container(border=True):
+                            st.markdown(f"**📌 [{row['regulation_name']}] {row['ref_no']} {row['article_title']}** :grey[[시행일자: {row['reg_date']}]]")
+                            st.markdown(highlight_spans(row['content'], spans, "green"))
+                else:
+                    st.caption("타 규정 참조 내역이 없습니다.")
     else:
         st.info("데이터베이스에 등록된 규정 데이터가 없습니다.")
