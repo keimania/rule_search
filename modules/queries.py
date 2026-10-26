@@ -1,5 +1,3 @@
-import io
-import re
 import pandas as pd
 import streamlit as st
 
@@ -95,73 +93,22 @@ def get_menu5_detail(target, date, ref):
     finally:
         conn.close()
 
-def parse_search_query(query_str: str):
-    """
-    복합 검색어를 AND / OR / NOT 구조로 파싱.
-    - '|' 또는 ' OR ' : OR 분기
-    - 공백 : AND 결합
-    - '-단어' : NOT 제외
-    """
-    raw = query_str.strip()
-    if not raw:
-        return []
-    or_chunks = re.split(r'\s*\|\s*|\s+OR\s+', raw)
-    branches = []
-    for chunk in or_chunks:
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        tokens = chunk.split()
-        must = []
-        exclude = []
-        for t in tokens:
-            t = t.strip()
-            if not t:
-                continue
-            if t.startswith("-") and len(t) > 1:
-                exclude.append(t[1:])
-            else:
-                must.append(t)
-        if must or exclude:
-            branches.append({"must": must, "exclude": exclude})
-    return branches
-
 @st.cache_data(ttl=600)
 def get_menu6_keyword_search(target, keyword, latest):
-    """메뉴 6: 통합 키워드 검색 - 캐시 적용 (복합 연산자 AND / OR / NOT 및 원문자/숫자 항 상호 호환)"""
+    """메뉴 6: 통합 키워드 검색 - 캐시 적용 (원문자/숫자 항 및 조항 번호 상호 호환)"""
     conn = get_connection()
     try:
-        branches = parse_search_query(keyword)
-        if not branches:
-            branches = [{"must": [keyword], "exclude": []}]
-
-        branch_sql_list = []
+        variants = get_hang_variants(keyword)
+        if not variants:
+            variants = [keyword]
+        sub_conds = []
         p = []
-
-        for branch in branches:
-            sub_conds = []
-            # 1. 필수 포함 단어 (AND)
-            for word in branch["must"]:
-                variants = get_hang_variants(word) or [word]
-                word_or = " OR ".join(["(content LIKE ? OR article_title LIKE ? OR ref_no LIKE ?)" for _ in variants])
-                sub_conds.append(f"({word_or})")
-                for v in variants:
-                    p.extend([f"%{v}%", f"%{v}%", f"%{v}%"])
-
-            # 2. 제외 단어 (NOT)
-            for ex in branch["exclude"]:
-                sub_conds.append("(content NOT LIKE ? AND article_title NOT LIKE ?)")
-                p.extend([f"%{ex}%", f"%{ex}%"])
-
-            if sub_conds:
-                branch_sql_list.append("(" + " AND ".join(sub_conds) + ")")
-
-        if branch_sql_list:
-            where_expr = " OR ".join(branch_sql_list)
-        else:
-            where_expr = "1=1"
-
-        q = f"SELECT regulation_name, reg_date, ref_no, article_title, content FROM regulation_history WHERE ({where_expr})"
+        for v in variants:
+            sub_conds.append("(content LIKE ? OR article_title LIKE ? OR ref_no LIKE ?)")
+            p.extend([f"%{v}%", f"%{v}%", f"%{v}%"])
+            
+        cond_str = " OR ".join(sub_conds)
+        q = f"SELECT regulation_name, reg_date, ref_no, article_title, content FROM regulation_history WHERE ({cond_str})"
         if target != "전체 규정 (All)":
             q += " AND regulation_name = ?"
             p.append(target)
@@ -231,7 +178,7 @@ def get_target_article_content(target_reg: str, target_art: str, latest_only: bo
 
 @st.cache_data(ttl=600)
 def get_menu7_reference_analysis(target_reg, target_art, latest_only):
-    """메뉴 7: 조항 인용 및 역참조 분석 - 캐시 적용 (연속 조항 열거 및 지배 접두어 문맥 분석 - 31b8d53 복구)"""
+    """메뉴 7: 조항 인용 및 역참조 분석 - 캐시 적용 (연속 조항 열거 및 지배 접두어 문맥 분석)"""
     conn = get_connection()
     try:
         clean_art, partner_reg_name, terms_internal, terms_partner, terms_external = get_citation_terms(target_reg, target_art)
@@ -285,46 +232,3 @@ def get_menu7_reference_analysis(target_reg, target_art, latest_only):
         return df_res, partner_reg_name, clean_art, variants
     finally:
         conn.close()
-
-# =========================================================
-# 엑셀/CSV 데이터 내보내기 헬퍼 함수
-# =========================================================
-def export_dataframe_to_excel(df: pd.DataFrame, sheet_name: str = "검색결과") -> bytes:
-    """단일 DataFrame을 엑셀(.xlsx) 바이너리 스트림으로 변환"""
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, sheet_name=sheet_name[:30], index=False)
-    return output.getvalue()
-
-def export_menu7_to_excel(df_target: pd.DataFrame, results_internal: list, results_partner: list, results_external: list, target_reg: str, clean_art: str, partner_reg_name: str) -> bytes:
-    """메뉴 7 역참조 분석 결과를 다중 시트 엑셀(.xlsx) 파일로 변환"""
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        has_sheet = False
-        # 시트 1: 관심 조항 원문
-        if not df_target.empty:
-            df_target.to_excel(writer, sheet_name="관심조항원문", index=False)
-            has_sheet = True
-            
-        # 시트 2: 내부 참조
-        if results_internal:
-            df_int = pd.DataFrame([r[0] for r in results_internal])
-            df_int.to_excel(writer, sheet_name="내부참조", index=False)
-            has_sheet = True
-            
-        # 시트 3: 파트너 규정 참조
-        if results_partner:
-            df_part = pd.DataFrame([r[0] for r in results_partner])
-            df_part.to_excel(writer, sheet_name="파트너참조", index=False)
-            has_sheet = True
-            
-        # 시트 4: 타 규정 참조
-        if results_external:
-            df_ext = pd.DataFrame([r[0] for r in results_external])
-            df_ext.to_excel(writer, sheet_name="타규정참조", index=False)
-            has_sheet = True
-
-        if not has_sheet:
-            pd.DataFrame([{"안내": "검색 결과가 없습니다."}]).to_excel(writer, sheet_name="결과없음", index=False)
-            
-    return output.getvalue()

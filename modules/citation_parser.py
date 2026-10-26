@@ -1,5 +1,3 @@
-import difflib
-import html
 import re
 from modules.config import CIRCLED_TO_ARABIC, ARABIC_TO_CIRCLED
 
@@ -114,18 +112,26 @@ def is_external_prefixed(content: str, start: int, is_rule: bool) -> bool:
     내부 조항이 아닌 외부 법규/상위 규정(또는 하위 세칙)에 종속된 인용인지 판별.
     """
     chunk = content[max(0, start - 150):start]
+    # 문장 또는 절 구분 기호(. \n ;) 기준 마지막 절 확인
     parts = re.split(r'[\.\n;]', chunk)
     before = parts[-1]
     
     if is_rule:
+        # 대상이 '시행세칙'인 경우:
+        # 상위 '규정', 법, 영, 시행령, 규칙 등 외부 규정이 앞에 붙은 경우 제외
+        # 1. 직전 단어 확인 (예: '규정 ', '규정', '업무규정 ', '「유가증권시장 업무규정」 ', '법 ', '영 ')
         if re.search(r'(?:이\s*|동\s*|당해\s*|해당\s*)?[가-힣]*(?:규정|법|영|시행령|규칙)(?:」|』|\"|\')?\s*$', before):
             return True
+        # 2. 나열형 확인: '규정 제20조, 제21조제1항 및 ' 등 규정 하위 나열
         m = re.search(r'(?:이\s*|동\s*|당해\s*|해당\s*)?[가-힣]*(?:규정|법|영|시행령|규칙)(?:」|』|\"|\')?\s+(.+)$', before)
         if m:
             between = m.group(1)
             if re.match(r'^(?:제\s*[\d①-⑳가-힣호목조항의\s]+(?:,|및|·|부터|~|\s+및\s+)\s*)+$', between):
                 return True
     else:
+        # 대상이 '규정'(상위)인 경우:
+        # '세칙', '시행세칙', '규칙' 또는 법, 영 등 타 법령이 앞에 붙은 경우 제외
+        # (주의: '이 규정 제X조'는 자기 자신(내부) 참조이므로 제외 대상이 아님)
         if re.search(r'(?:이\s*|동\s*|당해\s*|해당\s*)?[가-힣]*(?:시행세칙|세칙|규칙|법|영|시행령)(?:」|』|\"|\')?\s*$', before):
             return True
         m = re.search(r'(?:이\s*|동\s*|당해\s*|해당\s*)?[가-힣]*(?:시행세칙|세칙|규칙|법|영|시행령)(?:」|』|\"|\')?\s+(.+)$', before)
@@ -136,75 +142,6 @@ def is_external_prefixed(content: str, start: int, is_rule: bool) -> bool:
 
     return False
 
-# =========================================================
-# 신구대조표 및 변경 감지 (띄어쓰기·문장부호 무시 및 Inline Diff 시각화)
-# =========================================================
-def normalize_comparable_text(text: str) -> str:
-    """
-    조항 개정 비교를 위한 정규화:
-    - 띄어쓰기(공백, 줄바꿈) 무시
-    - 마침표(.), 쉼표(,), 따옴표, 괄호 등 단순 문장부호 유무 무시
-    """
-    if not text:
-        return ""
-    # 따옴표 및 전각 기호 통일
-    t = text.replace('“', '"').replace('”', '"').replace('‘', "'").replace('’', "'")
-    t = t.replace('（', '(').replace('）', ')').replace('＜', '<').replace('＞', '>')
-    # 공백, 마침표, 쉼표 등 문장부호 제거하여 실질 텍스트만 비교
-    return re.sub(r'[\s\.\,·~;:\'\"]', '', t)
-
-def is_substantive_change(old_text: str, new_text: str) -> bool:
-    """두 텍스트 사이에 단순 띄어쓰기나 마침표(.) 유무를 넘어선 실질적 내용 변경이 있는지 판별"""
-    if old_text is None or new_text is None:
-        return old_text != new_text
-    return normalize_comparable_text(old_text) != normalize_comparable_text(new_text)
-
-def generate_inline_diff_html(old_text: str, new_text: str) -> str:
-    """
-    이전 텍스트와 현재 텍스트의 어절/단어 단위 실질 변경 사항을 시각화하는 인라인 Diff HTML 생성.
-    단순 띄어쓰기나 마침표(.) 유무 등 사소한 표기 차이는 변경으로 강조하지 않고 자연스럽게 유지합니다.
-    """
-    if not old_text and not new_text:
-        return ""
-    if not old_text:
-        return f'<ins style="background-color: #e6ffed; color: #22863a; text-decoration: none; font-weight: bold; padding: 2px 4px; border-radius: 3px;">{html.escape(new_text)}</ins>'
-    if not new_text:
-        return f'<del style="background-color: #ffeef0; color: #cb2431; text-decoration: line-through; padding: 2px 4px; border-radius: 3px;">{html.escape(old_text)}</del>'
-
-    # 한글/영문/숫자 단어, 문장부호 및 기호, 공백을 세밀하게 분리하여 토큰화
-    token_pattern = re.compile(r'[가-힣\w]+|[^\w\s]|\s+')
-    old_tokens = token_pattern.findall(old_text)
-    new_tokens = token_pattern.findall(new_text)
-
-    matcher = difflib.SequenceMatcher(None, old_tokens, new_tokens)
-    result = []
-
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        old_chunk = "".join(old_tokens[i1:i2])
-        new_chunk = "".join(new_tokens[j1:j2])
-
-        if tag == 'equal':
-            result.append(html.escape(new_chunk))
-        elif normalize_comparable_text(old_chunk) == normalize_comparable_text(new_chunk):
-            # 단순 띄어쓰기나 마침표/쉼표 등 기호 유무 차이는 변경으로 표시하지 않음
-            result.append(html.escape(new_chunk))
-        elif tag == 'delete':
-            esc_old = html.escape(old_chunk)
-            result.append(f'<del style="background-color: #ffeef0; color: #cb2431; text-decoration: line-through; padding: 2px 4px; border-radius: 3px; margin: 0 1px;">{esc_old}</del>')
-        elif tag == 'insert':
-            esc_new = html.escape(new_chunk)
-            result.append(f'<ins style="background-color: #e6ffed; color: #22863a; text-decoration: none; font-weight: bold; padding: 2px 4px; border-radius: 3px; margin: 0 1px;">{esc_new}</ins>')
-        elif tag == 'replace':
-            esc_old = html.escape(old_chunk)
-            esc_new = html.escape(new_chunk)
-            result.append(f'<del style="background-color: #ffeef0; color: #cb2431; text-decoration: line-through; padding: 2px 4px; border-radius: 3px; margin: 0 1px;">{esc_old}</del>')
-            result.append(f'<ins style="background-color: #e6ffed; color: #22863a; text-decoration: none; font-weight: bold; padding: 2px 4px; border-radius: 3px; margin: 0 1px;">{esc_new}</ins>')
-
-    return "".join(result)
-
-# =========================================================
-# 조항 인용 파서 (31b8d53 버전 복구)
-# =========================================================
 def parse_clause_citations(text: str):
     """
     본문 텍스트 내에서 모든 조항 언급과 이를 지배하는 규정/법령 접두어를 순서대로 추출.
@@ -248,7 +185,6 @@ def parse_clause_citations(text: str):
         prev_end = matches[i - 1].end() if i > 0 else 0
         between = text[prev_end:start]
 
-        # between 내에서 가장 마지막으로 등장한 접두어 탐색
         p_matches = list(prefix_pattern.finditer(between))
         gov_prefix = None
 
@@ -258,7 +194,6 @@ def parse_clause_citations(text: str):
             after_p = between[last_p.end():]
 
             # after_p에 단절 요인이 있는지 검사
-            # 문장 부호(. \n ;)나 단절성 조사/어미/명사 등이 있으면 상속하지 않음
             if not re.search(r'[\.\n;]|\b(?:을|를|은|는|이|가|에서|에게|위반|경우|인하여)\b|에\s*따라|에\s*의하', after_p):
                 gov_prefix = p_text
 
@@ -279,14 +214,12 @@ def parse_clause_citations(text: str):
 
     return citations
 
-def match_article(clause_str, target_variants: list) -> bool:
+def match_article(clause_str: str, target_variants: list) -> bool:
     """
-    본문에서 추출된 조항 표기(clause_str 또는 citation dict)가 검색 대상 조항 변형(target_variants)에 부합하는지 판별.
+    본문에서 추출된 조항 표기(clause_str)가 검색 대상 조항 변형(target_variants)에 부합하는지 판별.
     - 예: target='제25조'일 때: '제25조', '제25조제1항', '제25조제①항' 모두 매칭 (단 '제25조의2'는 제외)
     - 예: target='제25조제1항'일 때: '제25조제1항', '제25조제①항' 매칭
     """
-    if isinstance(clause_str, dict):
-        clause_str = clause_str.get('clause', '')
     norm_clause = normalize_art_input(clause_str)
     clause_hang_variants = get_hang_variants(norm_clause) or [norm_clause]
 
@@ -364,6 +297,7 @@ def highlight_spans(text: str, spans: list, color: str = "red") -> str:
     """주어진 인덱스 구간(spans)들만 지정 색상 마크다운으로 하이라이트"""
     if not text or not spans:
         return text or ""
+    # 중복 구간 병합
     sorted_spans = sorted(set(spans), key=lambda x: (x[0], -x[1]))
     merged = []
     for s, e in sorted_spans:
