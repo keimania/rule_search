@@ -6,6 +6,8 @@ import os
 import re
 import io
 import sys
+import difflib
+import html
 from pathlib import Path
 import unicodedata
 import urllib.parse
@@ -75,11 +77,149 @@ def to_arabic_hang(s: str) -> str:
     return re.sub(r"(제\s*)?([①-⑳])(\s*항)?", _repl, s)
 
 def normalize_art_input(text: str) -> str:
-    """조항 번호 입력 정규화 (예: '20조' -> '제20조')"""
+    """
+    조항 번호 입력 스마트 정규화:
+    - 접두어 보정: '20조' -> '제20조'
+    - 가지조항 보정: '20조2', '제20조2', '제20조 2' -> '제20조의2'
+    - 항 띄어쓰기 및 접두어 보정: '20조 1항' -> '제20조제1항', '제20조1항' -> '제20조제1항'
+    """
     s = text.strip() if text else ""
-    if re.match(r"^\d+조", s):
+    if not s:
+        return ""
+    if not s.startswith("제") and re.match(r"^\d+조", s):
         s = f"제{s}"
+    s = re.sub(r'^(제\d+조)\s*(\d+)(?!\d*항)', r'\1의\2', s)
+    s = re.sub(r'^(제\d+조)\s*의\s*(\d+)', r'\1의\2', s)
+    s = re.sub(r'(제\d+조(?:의\d+)?)\s*(\d+)항', r'\1제\2항', s)
+    s = re.sub(r'(제\d+조(?:의\d+)?)\s*(제?[①-⑳\d]+항)', r'\1\2', s)
     return s
+
+# =========================================================
+# 신구대조표 및 변경 감지 유틸리티
+# =========================================================
+def normalize_comparable_text(text: str) -> str:
+    """
+    조항 개정 비교를 위한 정규화:
+    - 띄어쓰기(공백, 줄바꿈) 무시
+    - 마침표(.), 쉼표(,), 따옴표, 괄호 등 단순 문장부호 유무 무시
+    """
+    if not text:
+        return ""
+    t = text.replace('“', '"').replace('”', '"').replace('‘', "'").replace('’', "'")
+    t = t.replace('（', '(').replace('）', ')').replace('＜', '<').replace('＞', '>')
+    return re.sub(r'[\s\.\,·~;:\'\"]', '', t)
+
+def is_substantive_change(old_text: str, new_text: str) -> bool:
+    """두 텍스트 사이에 단순 띄어쓰기나 마침표(.) 유무를 넘어선 실질적 내용 변경이 있는지 판별"""
+    if old_text is None or new_text is None:
+        return old_text != new_text
+    return normalize_comparable_text(old_text) != normalize_comparable_text(new_text)
+
+def generate_inline_diff_html(old_text: str, new_text: str) -> str:
+    """
+    이전 텍스트와 현재 텍스트의 어절/단어 단위 실질 변경 사항을 시각화하는 인라인 Diff HTML 생성.
+    단순 띄어쓰기나 마침표(.) 유무 등 사소한 표기 차이는 변경으로 강조하지 않고 자연스럽게 유지합니다.
+    """
+    if not old_text and not new_text:
+        return ""
+    if not old_text:
+        return f'<ins style="background-color: #e6ffed; color: #22863a; text-decoration: none; font-weight: bold; padding: 2px 4px; border-radius: 3px;">{html.escape(new_text)}</ins>'
+    if not new_text:
+        return f'<del style="background-color: #ffeef0; color: #cb2431; text-decoration: line-through; padding: 2px 4px; border-radius: 3px;">{html.escape(old_text)}</del>'
+
+    token_pattern = re.compile(r'[가-힣\w]+|[^\w\s]|\s+')
+    old_tokens = token_pattern.findall(old_text)
+    new_tokens = token_pattern.findall(new_text)
+
+    matcher = difflib.SequenceMatcher(None, old_tokens, new_tokens)
+    result = []
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        old_chunk = "".join(old_tokens[i1:i2])
+        new_chunk = "".join(new_tokens[j1:j2])
+
+        if tag == 'equal':
+            result.append(html.escape(new_chunk))
+        elif normalize_comparable_text(old_chunk) == normalize_comparable_text(new_chunk):
+            result.append(html.escape(new_chunk))
+        elif tag == 'delete':
+            esc_old = html.escape(old_chunk)
+            result.append(f'<del style="background-color: #ffeef0; color: #cb2431; text-decoration: line-through; padding: 2px 4px; border-radius: 3px; margin: 0 1px;">{esc_old}</del>')
+        elif tag == 'insert':
+            esc_new = html.escape(new_chunk)
+            result.append(f'<ins style="background-color: #e6ffed; color: #22863a; text-decoration: none; font-weight: bold; padding: 2px 4px; border-radius: 3px; margin: 0 1px;">{esc_new}</ins>')
+        elif tag == 'replace':
+            esc_old = html.escape(old_chunk)
+            esc_new = html.escape(new_chunk)
+            result.append(f'<del style="background-color: #ffeef0; color: #cb2431; text-decoration: line-through; padding: 2px 4px; border-radius: 3px; margin: 0 1px;">{esc_old}</del>')
+            result.append(f'<ins style="background-color: #e6ffed; color: #22863a; text-decoration: none; font-weight: bold; padding: 2px 4px; border-radius: 3px; margin: 0 1px;">{esc_new}</ins>')
+
+    return "".join(result)
+
+# =========================================================
+# 복합 검색어 파서 및 엑셀 다운로드 유틸리티
+# =========================================================
+def parse_search_query(query_str: str):
+    """
+    검색어 문자열을 분석하여 (or_groups, not_terms) 반환.
+    - or_groups: OR(|)로 구분된 그룹들의 리스트. 각 그룹은 AND(공백) 조건 단어들의 리스트.
+    - not_terms: 제외(-)할 단어들의 리스트.
+    예: '공매도 호가 | 거래정지 -세칙'
+      -> or_groups: [['공매도', '호가'], ['거래정지']]
+      -> not_terms: ['세칙']
+    """
+    not_terms = []
+    raw_tokens = query_str.strip().split()
+    clean_tokens = []
+    for tok in raw_tokens:
+        if tok.startswith("-") and len(tok) > 1:
+            not_terms.append(tok[1:])
+        else:
+            clean_tokens.append(tok)
+            
+    clean_query = " ".join(clean_tokens)
+    if not clean_query:
+        return [], not_terms
+        
+    or_parts = [p.strip() for p in clean_query.split("|") if p.strip()]
+    or_groups = []
+    for part in or_parts:
+        and_terms = part.split()
+        if and_terms:
+            or_groups.append(and_terms)
+            
+    return or_groups, not_terms
+
+def export_dataframe_to_excel(df: pd.DataFrame, sheet_name: str = "검색결과") -> bytes:
+    """단일 DataFrame을 엑셀(.xlsx) 바이너리 스트림으로 변환"""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name=sheet_name[:30], index=False)
+    return output.getvalue()
+
+def export_menu7_to_excel(df_target: pd.DataFrame, results_internal: list, results_partner: list, results_external: list, target_reg: str, clean_art: str, partner_reg_name: str) -> bytes:
+    """메뉴 7 역참조 분석 결과를 다중 시트 엑셀(.xlsx) 파일로 변환"""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        has_sheet = False
+        if not df_target.empty:
+            df_target.to_excel(writer, sheet_name="관심조항원문", index=False)
+            has_sheet = True
+        if results_internal:
+            df_int = pd.DataFrame([r[0] if isinstance(r, (tuple, list)) else r for r in results_internal])
+            df_int.to_excel(writer, sheet_name="내부참조", index=False)
+            has_sheet = True
+        if results_partner:
+            df_part = pd.DataFrame([r[0] if isinstance(r, (tuple, list)) else r for r in results_partner])
+            df_part.to_excel(writer, sheet_name="파트너참조", index=False)
+            has_sheet = True
+        if results_external:
+            df_ext = pd.DataFrame([r[0] if isinstance(r, (tuple, list)) else r for r in results_external])
+            df_ext.to_excel(writer, sheet_name="타규정참조", index=False)
+            has_sheet = True
+        if not has_sheet:
+            pd.DataFrame([{"안내": "검색 결과가 없습니다."}]).to_excel(writer, sheet_name="결과없음", index=False)
+    return output.getvalue()
 
 def get_hang_variants(text: str) -> list:
     """입력된 조항/키워드에 대해 원문자(①)/숫자(1), 띄어쓰기 유무 등 가능한 모든 동등 표현 생성"""
@@ -1880,24 +2020,45 @@ def get_menu5_detail(target, date, ref):
 
 @st.cache_data(ttl=600)
 def get_menu6_keyword_search(target, keyword, latest):
-    """메뉴 6: 통합 키워드 검색 - 캐시 적용 (원문자/숫자 항 및 조항 번호 상호 호환)"""
+    """메뉴 6: 통합 키워드 검색 - 캐시 적용 (복합 검색 AND/OR/NOT 및 원문자/숫자 항 상호 호환)"""
     conn = get_connection()
     try:
-        variants = get_hang_variants(keyword)
-        if not variants:
-            variants = [keyword]
-        sub_conds = []
+        or_groups, not_terms = parse_search_query(keyword)
+        if not or_groups and not not_terms:
+            return pd.DataFrame()
+
         p = []
-        for v in variants:
-            sub_conds.append("(content LIKE ? OR article_title LIKE ? OR ref_no LIKE ?)")
-            p.extend([f"%{v}%", f"%{v}%", f"%{v}%"])
-            
-        cond_str = " OR ".join(sub_conds)
-        q = f"SELECT regulation_name, reg_date, ref_no, article_title, content FROM regulation_history WHERE ({cond_str})"
+        or_clauses = []
+        for and_terms in or_groups:
+            and_clauses = []
+            for term in and_terms:
+                vars_list = get_hang_variants(term) or [term]
+                term_sub = []
+                for v in vars_list:
+                    term_sub.append("(content LIKE ? OR article_title LIKE ? OR ref_no LIKE ?)")
+                    p.extend([f"%{v}%", f"%{v}%", f"%{v}%"])
+                and_clauses.append(f"({' OR '.join(term_sub)})")
+            if and_clauses:
+                or_clauses.append(f"({' AND '.join(and_clauses)})")
+
+        not_clauses = []
+        for n_term in not_terms:
+            not_clauses.append("(content NOT LIKE ? AND article_title NOT LIKE ? AND ref_no NOT LIKE ?)")
+            p.extend([f"%{n_term}%", f"%{n_term}%", f"%{n_term}%"])
+
+        where_parts = []
+        if or_clauses:
+            where_parts.append(f"({' OR '.join(or_clauses)})")
+        if not_clauses:
+            where_parts.append(f"({' AND '.join(not_clauses)})")
+
+        where_expr = " AND ".join(where_parts) if where_parts else "1=1"
+
+        q = f"SELECT regulation_name, reg_date, ref_no, article_title, content FROM regulation_history WHERE ({where_expr})"
         if target != "전체 규정 (All)":
             q += " AND regulation_name = ?"
             p.append(target)
-        
+
         if latest:
             q += """
                 AND (regulation_name, reg_date) IN (
@@ -2040,39 +2201,82 @@ elif menu == MENU_NAMES["2"]:
 
 elif menu == MENU_NAMES["3"]:
     st.subheader("📖 규정 전문 조회")
+    st.caption("선택한 규정 및 개정일자의 전체 조문을 조회하고 파일로 다운로드합니다.")
     if reg_names:
         c1, c2 = st.columns(2)
         with c1: target = st.selectbox("규정", reg_names, index=default_reg_index)
         dates = get_regulation_dates(target)
         with c2: date = st.selectbox("날짜", dates) if dates else st.selectbox("날짜", [])
         
-        if st.button("조회"):
+        if st.button("조회", type="primary"):
             df = get_menu3_full_text(target, date)
-            st.dataframe(df, width='stretch', height=600)
+            if df.empty:
+                st.warning("해당 일자의 조문 데이터가 없습니다.")
+            else:
+                st.success(f"총 {len(df)}개 조항 조회 완료")
+                
+                # 다운로드 버튼
+                col_dl1, col_dl2 = st.columns(2)
+                with col_dl1:
+                    excel_bytes = export_dataframe_to_excel(df, sheet_name=target[:30])
+                    st.download_button(
+                        label="📥 전문 엑셀(.xlsx) 다운로드",
+                        data=excel_bytes,
+                        file_name=f"{target}_{date}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+                with col_dl2:
+                    full_txt = "\n\n".join([f"[{r['조항']}] {r['조명']}\n{r['내용']}" for _, r in df.iterrows()])
+                    st.download_button(
+                        label="📥 전문 텍스트(.txt) 다운로드",
+                        data=full_txt.encode('utf-8-sig'),
+                        file_name=f"{target}_{date}.txt",
+                        mime="text/plain",
+                        use_container_width=True
+                    )
+                st.dataframe(df, width='stretch', height=600)
     else:
         st.info("데이터베이스에 등록된 규정 데이터가 없습니다.")
 
 elif menu == MENU_NAMES["4"]:
     st.subheader("🕰️ 조항 변경 이력 추적")
+    st.caption("조항 번호를 입력하여 역대 개정 이력과 개정 전·후 신구대조표(Inline Diff)를 조회합니다.")
     if reg_names:
         c1, c2 = st.columns(2)
         with c1: target = st.selectbox("규정", reg_names, index=default_reg_index)
         with c2: ref = st.text_input("조항 번호", value=DEFAULT_ART_NO)
         
-        if st.button("히스토리 검색"):
-            df = get_menu4_history(target, ref)
-            if df.empty: st.warning("결과가 없습니다.")
+        if st.button("히스토리 검색", type="primary"):
+            norm_ref = normalize_art_input(ref)
+            df = get_menu4_history(target, norm_ref)
+            if df.empty:
+                st.warning(f"'{norm_ref}' 조항의 이력 결과가 없습니다. (입력값: {ref})")
             else:
                 for r_no, group in df.groupby('ref_no'):
                     with st.expander(f"📌 {r_no} ({group.iloc[0]['article_title']})", expanded=True):
                         prev = None
                         for _, row in group.iterrows():
-                            if prev is None: badge, color = "🆕 신설", "blue"
-                            elif prev != row['content']: badge, color = "✏️ 변경", "orange"
-                            else: badge, color = "─ 유지", "grey"
+                            if prev is None:
+                                badge, color = "🆕 신설", "blue"
+                            elif is_substantive_change(prev, row['content']):
+                                badge, color = "✏️ 변경", "orange"
+                            else:
+                                badge, color = "─ 유지", "grey"
+                                
                             st.markdown(f":{color}[**[{row['reg_date']}] {badge}**]")
-                            if badge == "✏️ 변경": st.code(row['content'], language=None)
-                            else: st.caption(row['content'])
+                            if badge == "✏️ 변경":
+                                diff_html = generate_inline_diff_html(prev, row['content'])
+                                st.markdown(
+                                    f"<div style='background-color:#f8f9fa; padding:12px; border-radius:6px; border:1px solid #e9ecef; margin-bottom:8px; line-height:1.6;'>{diff_html}</div>",
+                                    unsafe_allow_html=True
+                                )
+                                with st.expander("📄 개정 후 전문 보기", expanded=False):
+                                    st.caption(row['content'])
+                            elif badge == "🆕 신설":
+                                st.markdown(f"> {row['content']}")
+                            else:
+                                st.caption(row['content'])
                             st.divider()
                             prev = row['content']
     else:
@@ -2080,6 +2284,7 @@ elif menu == MENU_NAMES["4"]:
 
 elif menu == MENU_NAMES["5"]:
     st.subheader("🔎 특정 시점 조항 상세 조회")
+    st.caption("특정 규정의 지정 일자 버전에 수록된 특정 조항의 상세 내용을 조회합니다.")
     if reg_names:
         c1, c2, c3 = st.columns(3)
         with c1: target = st.selectbox("규정", reg_names, index=default_reg_index)
@@ -2087,14 +2292,19 @@ elif menu == MENU_NAMES["5"]:
         with c2: date = st.selectbox("날짜", dates) if dates else st.selectbox("날짜", [])
         with c3: ref = st.text_input("조항 번호", value=DEFAULT_ART_NO)
         
-        if st.button("조회"):
-            df = get_menu5_detail(target, date, ref)
-            st.table(df)
+        if st.button("조회", type="primary"):
+            norm_ref = normalize_art_input(ref)
+            df = get_menu5_detail(target, date, norm_ref)
+            if df.empty:
+                st.warning(f"'{norm_ref}' 조항을 찾을 수 없습니다. (입력값: {ref})")
+            else:
+                st.table(df)
     else:
         st.info("데이터베이스에 등록된 규정 데이터가 없습니다.")
 
 elif menu == MENU_NAMES["6"]:
     st.subheader("🔍 통합 키워드 검색")
+    st.caption("💡 **복합 검색 연산자 지원**: 공백(AND) · `|` (OR) · `-` (NOT 제외) (예: `공매도 호가` / `거래정지 | 중단` / `정리매매 -세칙`)")
     if reg_names:
         with st.form("keyword_search_form", border=False):
             c1, c2 = st.columns([1, 2])
@@ -2102,16 +2312,40 @@ elif menu == MENU_NAMES["6"]:
                 target = st.selectbox("대상", ["전체 규정 (All)"] + reg_names, index=0)
                 latest = st.checkbox("최신 규정만", value=True)
             with c2:
-                keyword = st.text_input("검색어", placeholder="예: 공매도")
+                keyword = st.text_input("검색어", placeholder="예: 공매도 호가 / 거래정지 | 중단")
                 btn = st.form_submit_button("검색", type="primary")
 
         if btn and keyword:
             df = get_menu6_keyword_search(target, keyword, latest)
-            if df.empty: st.warning("결과 없음")
+            if df.empty:
+                st.warning("결과 없음")
             else:
                 st.success(f"총 {len(df)}건 검색됨")
-                if len(df) > 200: st.warning("⚠️ 결과가 너무 많아 일부만 표시될 수 있습니다.")
-                    
+                if len(df) > 200:
+                    st.warning("⚠️ 결과가 너무 많아 일부만 표시될 수 있습니다.")
+                
+                # 엑셀 / CSV 다운로드 버튼
+                col_dl1, col_dl2 = st.columns(2)
+                safe_kw = re.sub(r'[^\w가-힣]', '_', keyword.strip())
+                with col_dl1:
+                    excel_bytes = export_dataframe_to_excel(df, sheet_name="통합키워드검색")
+                    st.download_button(
+                        label="📥 검색결과 엑셀(.xlsx) 다운로드",
+                        data=excel_bytes,
+                        file_name=f"검색결과_{safe_kw}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+                with col_dl2:
+                    csv_bytes = df.to_csv(index=False).encode('utf-8-sig')
+                    st.download_button(
+                        label="📥 검색결과 CSV 다운로드",
+                        data=csv_bytes,
+                        file_name=f"검색결과_{safe_kw}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+
                 kw_variants = get_hang_variants(keyword)
                 for _, row in df.iterrows():
                     with st.container(border=True):
@@ -2181,6 +2415,27 @@ elif menu == MENU_NAMES["7"]:
                     if any(t in content for t in terms_external): results_external.append(row)
 
             st.success(f"분석 완료: 내부 {len(results_internal)}건 / {partner_reg_name} {len(results_partner)}건 / 타 규정 {len(results_external)}건")
+
+            # 엑셀 다운로드 버튼
+            if not df_target.empty or results_internal or results_partner or results_external:
+                excel_m7_bytes = export_menu7_to_excel(
+                    df_target=df_target,
+                    results_internal=results_internal,
+                    results_partner=results_partner,
+                    results_external=results_external,
+                    target_reg=target_reg,
+                    clean_art=clean_art,
+                    partner_reg_name=partner_reg_name
+                )
+                safe_reg = target_reg.replace(" ", "_")
+                st.download_button(
+                    label="📥 인용 분석 결과 엑셀(.xlsx) 다운로드",
+                    data=excel_m7_bytes,
+                    file_name=f"인용분석_{safe_reg}_{clean_art}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    help="관심 조항 원문 및 내부/파트너/타규정 참조 분석 결과를 각각의 시트로 분리하여 저장합니다."
+                )
+                st.write("")
             
             st.markdown(f"### 🏠 [{target_reg}] 내부 참조")
             if results_internal:
