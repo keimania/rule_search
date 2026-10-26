@@ -24,78 +24,10 @@ def to_arabic_hang(s: str) -> str:
     return re.sub(r"(제\s*)?([①-⑳])(\s*항)?", _repl, s)
 
 def normalize_art_input(text: str) -> str:
-    """
-    조항 번호 입력 스마트 정규화.
-    다양한 사용자 약어 및 비표준 입력을 표준 법조문 조항 포맷으로 자동 변환합니다.
-    - '20' -> '제20조'
-    - '20조' -> '제20조'
-    - '제 20 조' -> '제20조'
-    - '20-2', '20_2', '20의2', '20조의2' -> '제20조의2'
-    - '제20조-2', '제20조 2' -> '제20조의2'
-    - '20 1항', '20조 1항', '20조 제1항' -> '제20조제1항'
-    - '20-2 1항' -> '제20조의2제1항'
-    """
-    if not text:
-        return ""
-    s = text.strip()
-    # 연속 공백 정리
-    s = re.sub(r"\s+", " ", s)
-
-    # 이미 '제X장', '제X절', '제X관' 등 장/절/관 표기인 경우 공백만 축소
-    if re.match(r"^제\s*\d+\s*(?:장|절|관)", s):
-        return re.sub(r"\s+", "", s)
-
-    # '제 20 조' 형태의 띄어쓰기 압축
-    s = re.sub(r"제\s*(\d+)\s*조", r"제\1조", s)
-    s = re.sub(r"조\s*의\s*(\d+)", r"조의\1", s)
-    s = re.sub(r"제\s*([①-⑳\d]+)\s*항", r"제\1항", s)
-    s = re.sub(r"제\s*(\d+)\s*호", r"제\1호", s)
-
-    # '제20조-2', '제20조_2' -> '제20조의2'
-    s = re.sub(r"제(\d+)조[-_](\d+)", r"제\1조의\2", s)
-
-    # 1. 20-2, 20_2 -> 제20조의2 (항 포함 가능)
-    m_hyphen = re.match(r"^(?:제\s*)?(\d+)[-_](\d+)(?:조)?(?:\s*(?:제?\s*([①-⑳\d]+)\s*항)?)?$", s)
-    if m_hyphen:
-        main_no, sub_no, hang_no = m_hyphen.group(1), m_hyphen.group(2), m_hyphen.group(3)
-        res = f"제{main_no}조의{sub_no}"
-        if hang_no:
-            res += f"제{hang_no}항"
-        return res
-
-    # 2. 20의2, 20조의2, 제20조의2 (항 포함 가능)
-    m_sub = re.match(r"^(?:제\s*)?(\d+)(?:조)?(?:의\s*(\d+))(?:\s*(?:제?\s*([①-⑳\d]+)\s*항)?)?$", s)
-    if m_sub:
-        main_no, sub_no, hang_no = m_sub.group(1), m_sub.group(2), m_sub.group(3)
-        res = f"제{main_no}조의{sub_no}"
-        if hang_no:
-            res += f"제{hang_no}항"
-        return res
-
-    # 3. 20조 2 (공백 후 숫자 -> 조의2로 해석)
-    m_space_sub = re.match(r"^(?:제\s*)?(\d+)\s*조\s+(\d+)(?:\s*(?:제?\s*([①-⑳\d]+)\s*항)?)?$", s)
-    if m_space_sub:
-        main_no, sub_no, hang_no = m_space_sub.group(1), m_space_sub.group(2), m_space_sub.group(3)
-        res = f"제{main_no}조의{sub_no}"
-        if hang_no:
-            res += f"제{hang_no}항"
-        return res
-
-    # 4. 20 -> 제20조, 20 1항 -> 제20조제1항 (숫자로만 시작하고 조가 생략된 경우)
-    m_simple = re.match(r"^(?:제\s*)?(\d+)(?:조)?(?:\s*(?:제?\s*([①-⑳\d]+)\s*항)?)?$", s)
-    if m_simple and (not s.startswith("제") or "조" not in s):
-        main_no, hang_no = m_simple.group(1), m_simple.group(2)
-        res = f"제{main_no}조"
-        if hang_no:
-            res += f"제{hang_no}항"
-        return res
-
-    # 5. 20조 -> 제20조
+    """조항 번호 입력 정규화 (예: '20조' -> '제20조')"""
+    s = text.strip() if text else ""
     if re.match(r"^\d+조", s):
         s = f"제{s}"
-
-    # 6. 제20조 제1항 -> 제20조제1항
-    s = re.sub(r"(제\d+조(?:의\d+)?)\s+(제?[①-⑳\d]+항)", r"\1\2", s)
     return s
 
 def get_hang_variants(text: str) -> list:
