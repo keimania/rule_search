@@ -2243,11 +2243,13 @@ elif menu == MENU_NAMES["4"]:
     st.subheader("🕰️ 조항 변경 이력 추적")
     st.caption("조항 번호를 입력하여 역대 개정 이력과 개정 전·후 신구대조표(Inline Diff)를 조회합니다.")
     if reg_names:
-        c1, c2 = st.columns(2)
-        with c1: target = st.selectbox("규정", reg_names, index=default_reg_index)
-        with c2: ref = st.text_input("조항 번호", value=DEFAULT_ART_NO)
+        with st.form("history_form", border=False):
+            c1, c2 = st.columns(2)
+            with c1: target = st.selectbox("규정", reg_names, index=default_reg_index)
+            with c2: ref = st.text_input("조항 번호", value=DEFAULT_ART_NO)
+            search_btn = st.form_submit_button("히스토리 검색", type="primary")
         
-        if st.button("히스토리 검색", type="primary"):
+        if search_btn and ref:
             norm_ref = normalize_art_input(ref)
             df = get_menu4_history(target, norm_ref)
             if df.empty:
@@ -2286,13 +2288,17 @@ elif menu == MENU_NAMES["5"]:
     st.subheader("🔎 특정 시점 조항 상세 조회")
     st.caption("특정 규정의 지정 일자 버전에 수록된 특정 조항의 상세 내용을 조회합니다.")
     if reg_names:
-        c1, c2, c3 = st.columns(3)
+        c1, c2 = st.columns(2)
         with c1: target = st.selectbox("규정", reg_names, index=default_reg_index)
         dates = get_regulation_dates(target)
         with c2: date = st.selectbox("날짜", dates) if dates else st.selectbox("날짜", [])
-        with c3: ref = st.text_input("조항 번호", value=DEFAULT_ART_NO)
         
-        if st.button("조회", type="primary"):
+        with st.form("detail_form", border=False):
+            c3, c4 = st.columns([4, 1], vertical_alignment="bottom")
+            with c3: ref = st.text_input("조항 번호", value=DEFAULT_ART_NO)
+            with c4: search_btn = st.form_submit_button("조회", type="primary", use_container_width=True)
+        
+        if search_btn and ref:
             norm_ref = normalize_art_input(ref)
             df = get_menu5_detail(target, date, norm_ref)
             if df.empty:
