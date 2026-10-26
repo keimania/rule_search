@@ -42,7 +42,6 @@ from modules.citation_parser import (
     find_valid_internal_matches,
     highlight_spans,
     generate_inline_diff_html,
-    extract_outgoing_citations,
     is_substantive_change,
 )
 
@@ -571,7 +570,7 @@ elif menu == MENU_NAMES["6"]:
 
 elif menu == MENU_NAMES["7"]:
     st.subheader("🔗 조항 인용 및 역참조 분석")
-    st.caption("특정 규정의 조항이 내/외부에서 어떻게 인용되고 있는지(역참조), 그리고 해당 조항이 무엇을 참조하고 있는지(정방향) 종합 분석합니다.")
+    st.info("특정 규정의 조항이 내/외부에서 어떻게 인용되고 있는지 분석합니다.")
     
     if reg_names:
         with st.form("ref_analysis_form", border=False):
@@ -602,21 +601,6 @@ elif menu == MENU_NAMES["7"]:
                         st.markdown(f"**{sub_ref}**")
                         st.markdown(f"> {row['content']}")
                         st.markdown("")
-
-                # 1-1. 정방향 참조 (해당 조항이 인용하고 있는 조항들) 추출 및 팝오버 뷰어
-                combined_content = "\n".join(df_target['content'].tolist())
-                outgoing_list = extract_outgoing_citations(combined_content, curr_reg=target_reg)
-                if outgoing_list:
-                    st.markdown("##### ↗️ **[정방향 참조] 본 조항이 인용하고 있는 타 규정 및 조항**")
-                    badge_strs = [f"`{item['full_label']}`" for item in outgoing_list]
-                    st.markdown(" ".join(badge_strs))
-                    with st.popover(f"🔍 정방향 인용 조항 상세 목록 ({len(outgoing_list)}건)"):
-                        st.markdown(f"**[{target_reg} {clean_art}] 본문에서 인용 중인 조항 목록**")
-                        out_df = pd.DataFrame([
-                            {"구분/접두어": item["prefix"], "인용 조항": item["clause"], "원문 표기": item["raw"]}
-                            for item in outgoing_list
-                        ])
-                        st.dataframe(out_df, hide_index=True, use_container_width=True)
             else:
                 st.warning(f"⚠️ 선택하신 규정({target_reg})에서 '{clean_art}' 조항의 원문을 찾을 수 없습니다. (조항 번호를 확인해주세요)")
 
@@ -635,7 +619,7 @@ elif menu == MENU_NAMES["7"]:
                 
                 int_spans, part_spans, ext_spans = [], [], []
                 for c in citations:
-                    if match_article(c, variants):
+                    if match_article(c['clause'], variants):
                         cat = classify_reference(curr_reg, target_reg, partner_reg_name, c['gov_prefix'])
                         if cat == "internal":
                             int_spans.append(c['span'])
@@ -653,26 +637,27 @@ elif menu == MENU_NAMES["7"]:
 
             st.success(f"분석 완료: 내부 {len(results_internal)}건 / {partner_reg_name} {len(results_partner)}건 / 타 규정 {len(results_external)}건")
 
-            # 엑셀 다운로드 버튼
-            excel_m7_bytes = export_menu7_to_excel(
-                df_target=df_target,
-                results_internal=results_internal,
-                results_partner=results_partner,
-                results_external=results_external,
-                target_reg=target_reg,
-                clean_art=clean_art,
-                partner_reg_name=partner_reg_name
-            )
-            safe_reg = target_reg.replace(" ", "_")
-            st.download_button(
-                label="📥 인용 분석 결과 엑셀(.xlsx) 다운로드",
-                data=excel_m7_bytes,
-                file_name=f"인용분석_{safe_reg}_{clean_art}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                help="관심 조항 원문 및 내부/파트너/타규정 참조 분석 결과를 각각의 시트로 분리하여 저장합니다."
-            )
-            st.write("")
-
+            # 엑셀 다운로드 지원
+            if not df_target.empty or results_internal or results_partner or results_external:
+                excel_m7_bytes = export_menu7_to_excel(
+                    df_target=df_target,
+                    results_internal=results_internal,
+                    results_partner=results_partner,
+                    results_external=results_external,
+                    target_reg=target_reg,
+                    clean_art=clean_art,
+                    partner_reg_name=partner_reg_name
+                )
+                safe_reg = target_reg.replace(" ", "_")
+                st.download_button(
+                    label="📥 인용 분석 결과 엑셀(.xlsx) 다운로드",
+                    data=excel_m7_bytes,
+                    file_name=f"인용분석_{safe_reg}_{clean_art}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    help="관심 조항 원문 및 내부/파트너/타규정 참조 분석 결과를 각각의 시트로 분리하여 저장합니다."
+                )
+                st.write("")
+            
             st.markdown(f"### 🏠 [{target_reg}] 내부 참조")
             if results_internal:
                 for row, spans in results_internal:
@@ -683,7 +668,7 @@ elif menu == MENU_NAMES["7"]:
                 st.caption("결과 없음")
 
             st.markdown(f"### 🤝 [{partner_reg_name}] 참조")
-            st.caption("※ 연속 조항 열거(예: '규정 제6조, 제25조') 및 조문 범위 인용('제A조부터 제B조까지'), 대명사 문맥을 자동 반영하여 분석합니다.")
+            st.caption("※ 연속 조항 열거(예: '규정 제6조, 제25조') 및 하위 항·호 인용까지 지배 접두어 문맥을 자동 반영하여 분석합니다.")
             if results_partner:
                 for row, spans in results_partner:
                     with st.container(border=True):

@@ -231,7 +231,7 @@ def get_target_article_content(target_reg: str, target_art: str, latest_only: bo
 
 @st.cache_data(ttl=600)
 def get_menu7_reference_analysis(target_reg, target_art, latest_only):
-    """메뉴 7: 조항 인용 및 역참조 분석 - 캐시 적용 (연속 조항 열거, 조문 범위 인용 및 지배 접두어 문맥 분석)"""
+    """메뉴 7: 조항 인용 및 역참조 분석 - 캐시 적용 (연속 조항 열거 및 지배 접두어 문맥 분석 - 31b8d53 복구)"""
     conn = get_connection()
     try:
         clean_art, partner_reg_name, terms_internal, terms_partner, terms_external = get_citation_terms(target_reg, target_art)
@@ -239,8 +239,6 @@ def get_menu7_reference_analysis(target_reg, target_art, latest_only):
         
         prefix_tbl = "h." if latest_only else ""
         art_cond = " OR ".join([f"{prefix_tbl}content LIKE ?" for _ in variants])
-        # 조문 범위 인용(예: '제23조부터 제27조까지', '제5조 내지 제8조') 후보 포함 조건
-        range_cond = f"({prefix_tbl}content LIKE ? OR {prefix_tbl}content LIKE ?)"
         
         short_name = target_reg.split()[-1]
         ext_likes = [f"%{target_reg}%", f"%「{target_reg}」%"]
@@ -250,19 +248,16 @@ def get_menu7_reference_analysis(target_reg, target_art, latest_only):
         
         partner_like = f"%{partner_reg_name}%"
         
-        candidate_cond = f"(({art_cond}) OR {range_cond})"
-        
         where_clause = f"""
-            ({prefix_tbl}regulation_name = ? AND {candidate_cond}) OR 
-            ({prefix_tbl}regulation_name LIKE ? AND {candidate_cond}) OR
-            ({candidate_cond} AND ({ext_cond}))
+            ({prefix_tbl}regulation_name = ? AND ({art_cond})) OR 
+            ({prefix_tbl}regulation_name LIKE ? AND ({art_cond})) OR
+            (({art_cond}) AND ({ext_cond}))
         """
         
-        range_params = ["%부터%조까지%", "%내지%조%"]
         params = (
-            [target_reg] + [f"%{v}%" for v in variants] + range_params +
-            [partner_like] + [f"%{v}%" for v in variants] + range_params +
-            [f"%{v}%" for v in variants] + range_params + ext_likes
+            [target_reg] + [f"%{v}%" for v in variants] +
+            [partner_like] + [f"%{v}%" for v in variants] +
+            [f"%{v}%" for v in variants] + ext_likes
         )
         
         if latest_only:
