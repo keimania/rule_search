@@ -1123,6 +1123,8 @@ def init_db():
                 uploaded_at TIMESTAMPTZ DEFAULT NOW()
             )
         ''')
+        cursor.execute("ALTER TABLE regulation_history ENABLE ROW LEVEL SECURITY;")
+        cursor.execute("ALTER TABLE regulation_uploads ENABLE ROW LEVEL SECURITY;")
     else:
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS regulation_history (

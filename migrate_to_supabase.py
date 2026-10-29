@@ -84,6 +84,7 @@ def migrate():
     CREATE INDEX IF NOT EXISTS idx_reg_date ON regulation_history(reg_date);
     CREATE INDEX IF NOT EXISTS idx_ref_no ON regulation_history(ref_no);
     CREATE INDEX IF NOT EXISTS idx_name_date ON regulation_history(regulation_name, reg_date);
+    ALTER TABLE regulation_history ENABLE ROW LEVEL SECURITY;
     """
     pg_cur.execute(ddl)
     pg_conn.commit()
