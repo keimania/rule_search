@@ -331,11 +331,23 @@ def parse_all(text: str) -> pd.DataFrame:
     return pd.DataFrame(rows_clean, columns=["구분", "장번호", "장명", "절번호", "절명", "참조번호", "조명", "조", "항", "호", "목", "내용"])
 
 
+def _safe_str(val, default=""):
+    if val is None or (isinstance(val, float) and pd.isna(val)) or pd.isna(val):
+        return default
+    s = str(val).strip()
+    return default if s.lower() == "nan" else s
+
+
 def build_unique_keys(df: pd.DataFrame) -> list:
     key_counts = {}
     unique_keys = []
     for _, row in df.iterrows():
-        base_key = f"{row.get('구분', '')}_{row.get('조', '')}_{row.get('항', '')}_{row.get('호', '')}_{row.get('목', '')}"
+        ch = _safe_str(row.get('장번호', ''), _safe_str(row.get('구분', ''), '0'))
+        jo = _safe_str(row.get('조', ''), '0')
+        hang = _safe_str(row.get('항', ''), '0')
+        ho = _safe_str(row.get('호', ''), '0')
+        mok = _safe_str(row.get('목', ''), '0')
+        base_key = f"{ch}_{jo}_{hang}_{ho}_{mok}"
         count = key_counts.get(base_key, 0)
         key_counts[base_key] = count + 1
         ukey = base_key if count == 0 else f"{base_key}_{count}"
@@ -379,7 +391,8 @@ def sync_to_sqlite(csv_path: str, reg_name: str, reg_date: str, force: bool = Fa
 
     df['unique_key'] = build_unique_keys(df)
     batch = [
-        (reg_name, reg_date, row['unique_key'], row.get('참조번호', ''), row.get('조명', ''), str(row.get('내용', '')))
+        (reg_name, reg_date, row['unique_key'],
+         _safe_str(row.get('참조번호', '')), _safe_str(row.get('조명', '')), _safe_str(row.get('내용', '')))
         for _, row in df.iterrows()
     ]
     
@@ -423,7 +436,8 @@ def sync_to_supabase(csv_path: str, reg_name: str, reg_date: str, db_url: str, f
 
     df['unique_key'] = build_unique_keys(df)
     batch = [
-        (reg_name, reg_date, row['unique_key'], row.get('참조번호', ''), row.get('조명', ''), str(row.get('내용', '')))
+        (reg_name, reg_date, row['unique_key'],
+         _safe_str(row.get('참조번호', '')), _safe_str(row.get('조명', '')), _safe_str(row.get('내용', '')))
         for _, row in df.iterrows()
     ]
     
